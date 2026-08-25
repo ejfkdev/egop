@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 严格格式检查:任何未 gofmt 的文件直接 fail(不静默重写)。
+      - name: Format check
+        run: test -z "$(gofmt -l .)"
+
+      # 与本地 `make hygiene` 同源:vet + 全量测试。
+      - name: Vet and test
+        run: make hygiene
+
+      - name: Race detector
+        run: go test -race ./...
+
+      # 零平台绑定:核心包必须能编译到浏览器 wasm 与 wasip1(运行时能力由装配层注入)。
+      - name: Cross-compile (js/wasm + wasip1)
+        run: |
+          GOOS=js GOARCH=wasm go build ./contract/... ./host/... ./loader/...
+          GOOS=wasip1 GOARCH=wasm go build ./contract/... ./host/...

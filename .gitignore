@@ -1,0 +1,13 @@
+# 编译产物
+*.exe
+*.test
+*.out
+inproc
+/net
+
+# 行为账 / 运行时产物
+plugin.jsonl
+plugins/
+
+# 系统文件
+.DS_Store
