@@ -118,3 +118,39 @@ func TestToolsPanicIsolated(t *testing.T) {
 		t.Fatalf("tools = %d (want 0 after ToolSpecs panic)", len(got))
 	}
 }
+
+type panicCloser struct{ meta contract.Meta }
+
+func (p *panicCloser) Meta() contract.Meta         { return p.meta }
+func (p *panicCloser) Close(context.Context) error { panic("boom-close") }
+
+func TestClosePanicIsolated(t *testing.T) {
+	h := New[any](Options[any]{})
+	_ = h.Register(&panicCloser{meta: contract.Meta{ID: "pc", Name: "PC", Version: "1"}})
+	err := h.Close(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("Close err = %v (want panic isolated, not crash)", err)
+	}
+}
+
+func TestDeferredPluginFailureEvent(t *testing.T) {
+	bus := NewMemEvents()
+	h := New[any](Options[any]{Events: bus})
+	var failed []string
+	bus.Subscribe(&contract.EventFilter{Type: contract.EventPluginFailed}, func(_ context.Context, e contract.Event) {
+		var p struct {
+			Plugin string `json:"plugin"`
+		}
+		_ = json.Unmarshal(e.Payload, &p)
+		failed = append(failed, p.Plugin)
+	})
+	// b 懒注册(依赖 a 未到位→pending),且声称未知槽位→补载时被拒 → plugin.failed。
+	b := &demoPlugin{meta: contract.Meta{ID: "b", Name: "B", Version: "1", Slot: "no.such.slot",
+		Requires: contract.Requires{Deps: []contract.Dependency{{Plugin: "a", Kind: contract.DepInit}}}}}
+	_, _ = h.RegisterLazy(b)
+	_ = h.Register(&demoPlugin{meta: contract.Meta{ID: "a", Name: "A", Version: "1"}})
+
+	if len(failed) != 1 || failed[0] != "b" {
+		t.Fatalf("plugin.failed = %v (want [b])", failed)
+	}
+}

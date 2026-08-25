@@ -488,6 +488,7 @@ const (
 	EventPluginRegistered = "plugin.registered"
 	EventPluginRemoved    = "plugin.removed"
 	EventPluginReplaced   = "plugin.replaced"
+	EventPluginFailed     = "plugin.failed" // 懒插件补载硬失败(依赖到位后被拒),payload 含 error
 )
 
 // HasCapability 声明判定。

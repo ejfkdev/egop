@@ -116,6 +116,7 @@ func New[C any](opts Options[C]) *Host[C] {
 	opts.Events.EnsureTopic(contract.EventPluginRegistered)
 	opts.Events.EnsureTopic(contract.EventPluginRemoved)
 	opts.Events.EnsureTopic(contract.EventPluginReplaced)
+	opts.Events.EnsureTopic(contract.EventPluginFailed)
 	return &Host[C]{
 		plugins:        map[string]contract.Plugin{},
 		meta:           map[string]contract.Meta{},
@@ -295,9 +296,25 @@ func (h *Host[C]) retryPending() {
 	h.mu.Unlock()
 	for _, p := range ready {
 		if err := h.Register(p); err != nil {
-			h.logf("host: deferred plugin %s failed: %v", p.Meta().ID, err)
+			id := p.Meta().ID
+			h.logf("host: deferred plugin %s failed: %v", id, err)
+			h.emitPluginFailed(id, err)
 		}
 	}
+}
+
+// emitPluginFailed 广播懒插件补载硬失败(plugin.failed),供控制面观测。
+func (h *Host[C]) emitPluginFailed(id string, err error) {
+	if h.opts.Events == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{"plugin": id, "error": err.Error()})
+	h.opts.Events.Dispatch(context.Background(), contract.Event{
+		Type:    contract.EventPluginFailed,
+		Version: contract.EnvelopeVersion,
+		Source:  &contract.Origin{Kind: contract.OriginHost, Point: contract.EventPluginFailed, At: time.Now().UnixMilli()},
+		Payload: payload,
+	})
 }
 
 // removePendingLocked 从待补载队列移除指定 id(幂等;需持 h.mu)。
@@ -734,8 +751,8 @@ func (h *Host[C]) Close(ctx context.Context) error {
 	var errs []error
 	for _, r := range rows {
 		if d, ok := r.p.(contract.Disposer); ok {
-			if err := d.Close(ctx); err != nil {
-				errs = append(errs, fmt.Errorf("host: plugin %s: %w", r.id, err))
+			if err := closeDisposer(d, ctx, r.id); err != nil {
+				errs = append(errs, err)
 			}
 		}
 		if _, err := h.Remove(r.id, true); err != nil {
@@ -744,17 +761,21 @@ func (h *Host[C]) Close(ctx context.Context) error {
 	}
 	// 尚未补载的懒插件(依赖始终未到位)也一并清退:Disposer 资源(wasm 实例等)不泄漏。
 	h.mu.Lock()
-	pending := make([]contract.Plugin, 0, len(h.pendingPlugins))
-	for _, p := range h.pendingPlugins {
-		pending = append(pending, p)
+	type pendingRow struct {
+		id string
+		p  contract.Plugin
+	}
+	pending := make([]pendingRow, 0, len(h.pendingPlugins))
+	for id, p := range h.pendingPlugins {
+		pending = append(pending, pendingRow{id: id, p: p})
 	}
 	h.pending = nil
 	h.pendingPlugins = map[string]contract.Plugin{}
 	h.mu.Unlock()
-	for _, p := range pending {
-		if d, ok := p.(contract.Disposer); ok {
-			if err := d.Close(ctx); err != nil {
-				errs = append(errs, fmt.Errorf("host: pending plugin %s: %w", p.Meta().ID, err))
+	for _, pr := range pending {
+		if d, ok := pr.p.(contract.Disposer); ok {
+			if err := closeDisposer(d, ctx, pr.id); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
