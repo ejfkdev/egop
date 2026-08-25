@@ -99,10 +99,8 @@ type HostFace interface {
     Remove(pluginID string, cascade bool) ([]string, error)
     HasPlugin(id string) bool
     Plugins() []contract.Meta
-    SetConfig(pluginID string, cfg json.RawMessage) error   // 整对象替换
-    SetConfigField(pluginID, key string, value json.RawMessage) error  // 合并单字段
-    AppliedConfig(pluginID string) (json.RawMessage, bool)  // 宿主推过的缓存
-    EffectiveConfig(pluginID string) (json.RawMessage, bool) // 权威读回:ConfigProvider 优先,回退 applied
+    SetConfig(pluginID string, cfg json.RawMessage) error
+    AppliedConfig(pluginID string) (json.RawMessage, bool)
     SurfaceFor(pluginID string) (contract.Surface, bool)
     Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error)
 }
@@ -143,7 +141,8 @@ RegisterLazy(p contract.Plugin) (RegisterStatus, error)         // 依赖未满�
 Replace(p contract.Plugin) error
 Remove(pluginID string, cascade bool) ([]string, error)        // 级联卸载 / fail-closed
 Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error) // 含 schema 校验
-SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated
+SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated(整对象替换)
+SetConfigField(pluginID, key string, value json.RawMessage) error // 单字段合并(再下发)
 SurfaceFor(pluginID string) (contract.Surface, bool)
 Close(ctx) error                                               // 逆注册序 + Disposer 清退
 Plugins() []contract.Meta
@@ -154,8 +153,9 @@ Functions() []FnView                                            // 函数目录�
 Tools() []Tool[C]                                               // 工具收集(声明 tool.provide)
 OnHook(hookID string, fn contract.HookFunc) func()             // 注册 hook 回调(返回撤销)
 TriggerHook(ctx, hookID string, data json.RawMessage) []contract.HookResult // 触发 hook
-AppliedConfig(pluginID string) (json.RawMessage, bool)
-GetConfig(pluginID, key string) (json.RawMessage, bool)         // egop 读某插件生效配置的单个字段
+AppliedConfig(pluginID string) (json.RawMessage, bool)          // 宿主推过的缓存
+EffectiveConfig(pluginID string) (json.RawMessage, bool)        // 权威读回:ConfigProvider 优先,回退 applied
+GetConfig(pluginID, key string) (json.RawMessage, bool)         // 读 EffectiveConfig 的单个字段
 Snapshot() Snapshot                                            // {plugins,functions,capabilities,applied_config}
 ```
 

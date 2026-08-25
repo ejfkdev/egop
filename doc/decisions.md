@@ -50,3 +50,12 @@ wasm guest 无 ctx——事件里真正有用的存根（`Source`/`Labels`/`Payl
 
 `SlotSpec` 逐轴求差是「只多不少」的**最小**契约（声明面 ⊇ 槽位要求），不是相等校验。
 插件可以比槽位要求提供更多。
+
+## 10. 配置的双向契约与「读回真值」
+
+配置契约是成对的：`Configurable.ApplyConfig`（写，host→插件）+ `ConfigProvider.Config`
+（读，插件→host）。读侧**优先级**是 `ConfigProvider.Config()`（插件自述的权威生效配置，
+含默认值补齐/归一化/脱敏）→ 回退 `host.applied`（宿主推过的原始 delta）——因为缓存记的是
+「推了什么」，不等于「插件实际跑在什么配置上」。`ConfigFieldSpec.Default` 是**声明级默认值**
+（供 web UI 展示/回填），运行时真实默认仍以插件 `Config()` 为准。写侧语义显式区分：
+`Host.SetConfig` = 整对象替换，`Host.SetConfigField`（及门控的 `Surface.SetConfig`）= 单字段合并。
