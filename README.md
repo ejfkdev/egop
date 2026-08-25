@@ -88,19 +88,15 @@ for e := range rt.Events() { /* register/replace/remove/failed hot-reload events
 defer rt.Close()
 ```
 
-Runnable examples: `examples/inproc` (full in-process flow), `examples/dependency`
-(dependencies / cross-plugin call / batch load / slot contract), `examples/lazy` (lazy
-register + batch topo-sort), `examples/slots` (slot contract Slot/SlotSpec),
-`examples/tools` (tool surface), `examples/hooks` (hook dispatch), `examples/events`
-(event bus pub/sub), `examples/config` (config / function schema validation),
-`examples/capabilities` (capability surface + extension Op), `examples/net` (outbound
-network Net), `examples/exchange` (envelope translation table), `examples/fs` (fs.FS
-injection / cross-platform), `examples/storage` (per-plugin Storage injection),
-`examples/wasm` (minimal ABI plugin, `go test ./examples/wasm`), `examples/rawconn`
-(transport-agnostic byte stream), `examples/hotreload` (directory hot-reload Watch),
-`examples/collab` (cross-plugin metadata / config read-write), `examples/origin` (origin
-tracing), `examples/controlplane` (host control plane introspection). Every example
-directory has its own README; see [doc/examples.md](doc/examples.md) for the full table.
+Runnable examples — every directory has its own README, and the full table lives in
+[doc/examples.md](doc/examples.md):
+
+| Theme | Examples |
+|---|---|
+| In-process | `inproc` (end-to-end), `dependency` (deps / cross-call / batch / slots), `lazy` (lazy + topo-sort), `slots` (slot contract) |
+| Capability surface | `capabilities` (gating + Op), `config` (schema validation), `tools` (tool surface), `hooks` (hook dispatch), `events` (pub/sub), `origin` (origin tracing), `controlplane` (introspection) |
+| Loading shapes | `wasm` (minimal ABI), `hotreload` (watch), `rawconn` (remote channel), `collab` (plugin metadata / config) |
+| Injection seams | `fs` (fs.FS), `storage` (per-plugin persistence), `net` (outbound), `exchange` (envelope table) |
 
 ## Documentation
 

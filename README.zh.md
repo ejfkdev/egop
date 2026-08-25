@@ -84,18 +84,14 @@ for e := range rt.Events() { /* register/replace/remove/failed 热更事件 */ }
 defer rt.Close()
 ```
 
-完整可跑示例:`examples/inproc`(进程内全链路)、`examples/dependency`(依赖 /
-跨插件调用 / 批量装载 / 槽位契约)、`examples/lazy`(懒注册 + 批量拓扑排序)、
-`examples/slots`(槽位契约 Slot/SlotSpec)、
-`examples/tools`(工具面)、`examples/hooks`(Hook 派发)、`examples/events`(事件总线发布/订阅)、`examples/config`
-(配置/函数 schema 校验)、`examples/capabilities`(能力面 + 扩展 Op)、
-`examples/net`(出站网络 Net:Request/DialStream)、`examples/exchange`(信封翻译表)、
-`examples/fs`(fs.FS 注入 / 跨平台)、`examples/storage`(插件专属持久化 Storage 注入)、
-`examples/wasm`(最小 ABI 插件,`go test ./examples/wasm`)、
-`examples/rawconn`(传输无关,裸字节流)、`examples/hotreload`(目录热更 Watch)、
-`examples/collab`(跨插件元数据/配置读写权限)、`examples/origin`(溯源 Origin)、
-`examples/controlplane`(宿主控制面 Snapshot/Dependents/CapabilityIndex 反查)。
-各示例目录内均有 README，一览见 [`doc/examples.md`](doc/examples.md)。
+完整可跑示例（每目录均有 README，全表见 [`doc/examples.md`](doc/examples.md)）：
+
+| 主题 | 示例 |
+|---|---|
+| 进程内 | `inproc`（全链路）、`dependency`（依赖/跨调用/批量/槽位）、`lazy`（懒注册+拓扑）、`slots`（槽位契约） |
+| 能力面 | `capabilities`（门控+Op）、`config`（schema 校验）、`tools`（工具面）、`hooks`（Hook 派发）、`events`（事件总线）、`origin`（溯源）、`controlplane`（控制面反查） |
+| 装载形态 | `wasm`（最小 ABI）、`hotreload`（热更）、`rawconn`（远程通道）、`collab`（插件元数据/配置） |
+| 注入缝 | `fs`（fs.FS）、`storage`（插件持久化）、`net`（出站网络）、`exchange`（信封翻译表） |
 
 ## 文档
 
