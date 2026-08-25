@@ -152,7 +152,7 @@ defer rt.Close()
 | 能力面 | `capabilities` | `capabilities` | 先说后做:Surface 视图按此裁剪 |
 | 配置面 | `config` | `config` | 可下发配置字段（键+Schema,下发即校验） |
 | 可监点 | `listens` | `listens` | 插件要订阅的框架点（框架须先保证存在） |
-| 能力依赖 | `requires`(slot) | `needs` | 依赖槽位面（形状不同:富依赖 vs 槽位名清单,保留异名） |
+| 前置槽位 | `requires.deps`（富形态） | `needs`（槽位名清单） | 同主题形状不同:槽位前置是名字清单(运行时满足校验,非逐字段求差),插件自身依赖是富 `Dependency`(slot/kind/version)——保留异名 |
 | 工具依赖 | `needs_tools` | `needs_tools` | 需要框架提供的工具名（就位校验见下） |
 | 声明即生效 | 辅助:导出/副触发 | `tool.provide` | 是否向工具面提供工具（CapTools） |
 

@@ -157,7 +157,7 @@ The design follows three cordis mechanisms, mapped onto Go:
 | capabilities | `capabilities` | `capabilities` | "declare before use": Surface view is trimmed by this |
 | config | `config` | `config` | deliverable config fields (validated on delivery) |
 | listened points | `listens` | `listens` | framework points the plugin subscribes to |
-| capability deps | `requires`(slot) | `needs` | slot-face dependency |
+| prerequisite slots | `requires.deps` (rich) | `needs` (flat) | slot prerequisites are a name list; a plugin's own slot dependency is a rich `Dependency` (slot/kind/version) — same theme, distinct shapes/names |
 | tool deps | `needs_tools` | `needs_tools` | tool names the plugin requires |
 | tool provide | side effect | `tool.provide` | whether it contributes tools (CapTools) |
 
