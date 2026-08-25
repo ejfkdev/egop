@@ -327,6 +327,27 @@ func TestAttachStreamToken(t *testing.T) {
 	sess.Close()
 }
 
+func TestRemotePluginPanicIsolated(t *testing.T) {
+	// 远程插件(插件作者侧 CallFunc)panic 归一到错误回执,会话不崩、框架侧收到 error。
+	h, _ := remoteTestHost(t)
+	mf := loadManifest(t, remoteDemoManifest)
+	ops := &PluginOps{
+		CallFunc: func(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+			panic("boom-remote")
+		},
+	}
+	sess, err := AttachStream(context.Background(), inboundPipe(t, h, ""), mf, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	waitFor(t, 2*time.Second, func() bool { return h.HasPlugin("remote.demo") })
+
+	if _, err := h.Call(context.Background(), "remote.demo", "echo", json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("remote call err = %v (want panic-isolated error)", err)
+	}
+}
+
 // ---------- 出站模式:框架主动连接插件 ----------
 
 const fakeManifest = `{"id":"fake.demo","name":"Fake","version":"1.0.0","provides":{"capabilities":["tool.provide"],"functions":[{"name":"echo"}]},"tools":[{"name":"t1"}]}`

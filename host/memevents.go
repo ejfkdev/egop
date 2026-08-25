@@ -67,7 +67,11 @@ func (m *MemEvents) Dispatch(ctx context.Context, e contract.Event) {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
 	for _, en := range entries {
 		if en.filter.Match(e) {
-			en.fn(ctx, e)
+			// 观察者回调 panic 归一丢弃(不炸管线、不殃及其它订阅者):事件投递 best-effort。
+			func() {
+				defer func() { _ = recover() }()
+				en.fn(ctx, e)
+			}()
 		}
 	}
 }

@@ -602,8 +602,9 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 
 // Call 动态调用插件函数。默认对声明了 FuncSpec.Input/Output 的函数做 schema
 // 校验(Options.DisableFuncValidation 关闭),入参不合规在调用前拒绝、返回不合规
-// 在调用后拒绝。
-func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.RawMessage) (json.RawMessage, error) {
+// 在调用后拒绝。插件代码 panic 归一到 error(机制层 fail-closed)。
+func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.RawMessage) (out json.RawMessage, err error) {
+	defer fromPanic(&err, fmt.Sprintf("plugin %s function %q", pluginID, fname))
 	// 无调用来源(宿主/应用直接发起)时,注入框架来源——被调函数经 OriginFrom 知道是框架在调,
 	// 而非误判为"无调用者"。
 	if contract.OriginFrom(ctx) == nil {
@@ -615,8 +616,6 @@ func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.R
 	if !ok {
 		return nil, fmt.Errorf("host: plugin %s: function %q not registered", pluginID, fname)
 	}
-	var out json.RawMessage
-	var err error
 	if !h.opts.DisableFuncValidation && len(e.spec.Input) > 0 {
 		if issues := schema.Validate(e.spec.Input, input, "input"); len(issues) > 0 {
 			err = fmt.Errorf("host: plugin %s: function %q: %s", pluginID, fname, strings.Join(issues, "; "))
@@ -635,7 +634,10 @@ func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.R
 }
 
 // SetConfig 下发配置（配置 Schema 校验 + Configurable）。
-func (h *Host[C]) SetConfig(pluginID string, cfg json.RawMessage) error {
+// SetConfig 下发配置（配置 Schema 校验 + Configurable）。插件 ApplyConfig panic
+// 归一到 error(机制层 fail-closed)。
+func (h *Host[C]) SetConfig(pluginID string, cfg json.RawMessage) (err error) {
+	defer fromPanic(&err, fmt.Sprintf("plugin %s apply config", pluginID))
 	h.mu.Lock()
 	p, ok := h.plugins[pluginID]
 	m := h.meta[pluginID]
@@ -923,9 +925,11 @@ func (h *Host[C]) Tools() []Tool[C] {
 	return out
 }
 
-// Run 执行工具（返回字符串形态,供模型面直用）。
-func (t *Tool[C]) Run(ctx context.Context, tc *C, args json.RawMessage) (string, error) {
-	out, err := t.run(ctx, tc, args)
+// Run 执行工具（返回字符串形态,供模型面直用）。插件工具 panic 归一到 error。
+func (t *Tool[C]) Run(ctx context.Context, tc *C, args json.RawMessage) (s string, err error) {
+	defer fromPanic(&err, fmt.Sprintf("tool %q", t.Spec.Name))
+	var out json.RawMessage
+	out, err = t.run(ctx, tc, args)
 	if err != nil {
 		return "", err
 	}

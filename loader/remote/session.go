@@ -346,12 +346,34 @@ func (s *Session) recvLoop() {
 	}
 }
 
+// peerCall 执行 peer 处理器并把 panic 转成 error(入站调用边界 fail-closed:插件/对端
+// 处理器炸了由 egop 归一到错误回执,不 crash 会话)。
+func peerCall(fn func() (json.RawMessage, error)) (out json.RawMessage, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			out = nil
+			err = fmt.Errorf("remote: handler panic: %v", p)
+		}
+	}()
+	return fn()
+}
+
+// peerCallErr 同 peerCall,但处理器只返回 error。
+func peerCallErr(fn func() error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("remote: handler panic: %v", p)
+		}
+	}()
+	return fn()
+}
+
 func (s *Session) dispatchCall(ctx context.Context, peer Peer, f *Frame) {
 	if peer == nil {
 		s.replyErr(f.Id, "remote: call before handshake")
 		return
 	}
-	out, err := peer.HandleCall(ctx, f.Fname, f.Input)
+	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleCall(ctx, f.Fname, f.Input) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())
 		return
@@ -364,7 +386,7 @@ func (s *Session) dispatchTool(ctx context.Context, peer Peer, f *Frame) {
 		s.replyErr(f.Id, "remote: tool before handshake")
 		return
 	}
-	out, err := peer.HandleTool(ctx, f.Name, f.Input, f.Tctx)
+	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleTool(ctx, f.Name, f.Input, f.Tctx) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())
 		return
@@ -377,7 +399,7 @@ func (s *Session) dispatchHook(ctx context.Context, peer Peer, f *Frame) {
 		s.replyErr(f.Id, "remote: hook before handshake")
 		return
 	}
-	out, err := peer.HandleHook(ctx, f.HookID, f.Input)
+	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHook(ctx, f.HookID, f.Input) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())
 		return
@@ -390,7 +412,7 @@ func (s *Session) dispatchConfig(ctx context.Context, peer Peer, f *Frame) {
 		s.replyErr(f.Id, "remote: apply_config before handshake")
 		return
 	}
-	if err := peer.HandleApplyConfig(ctx, f.Config); err != nil {
+	if err := peerCallErr(func() error { return peer.HandleApplyConfig(ctx, f.Config) }); err != nil {
 		s.replyErr(f.Id, err.Error())
 		return
 	}
@@ -402,7 +424,7 @@ func (s *Session) dispatchHostCall(ctx context.Context, peer Peer, f *Frame) {
 		s.replyErr(f.Id, "remote: host_call before handshake")
 		return
 	}
-	out, err := peer.HandleHostCall(ctx, f.Op, f.Input)
+	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHostCall(ctx, f.Op, f.Input) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())
 		return

@@ -34,6 +34,10 @@ examples  ← 可跑示例,禁止示例里引入业务假设
   `{"ok":bool,"result":any,"result_b64":string,"error":string}`。
 - **能力门控**:先说后做。插件未声明 capability,Surface 视图直接不给/报错;
   new_op 进宿主必须挂守卫词(`Options.OpAliases` 可映射 wire 短名→守卫词)。
+- **机制层故障隔离**(插件不可信→fail-closed):宿主在调用插件代码的边界
+  (`Host.Call`/`SetConfig`/`Tool.Run`、hook 触发、事件订阅扇出、remote 入站
+  dispatch)把 panic 归一到 error(或 HookResult.Reason/丢弃),绝不炸穿宿主进程;
+  消费方不重复 recover。
 - **函数 schema 校验默认开**:`Host.Call` 对声明 `FuncSpec.Input/Output` 的函数
   做 JSON Schema 校验(入参调用前拒、返回调用后拒),`Options.DisableFuncValidation`
   可整体关;`schema.Validate` 支持 `type` 数组与 `anyOf`(多格式),有测试固化。

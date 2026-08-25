@@ -6,6 +6,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -73,11 +74,22 @@ func (m *MemHooks) Trigger(ctx context.Context, hookID string, data json.RawMess
 	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
 	out := make([]contract.HookResult, 0, len(entries))
 	for i, e := range entries {
-		r := contract.HookResultOf(e.fn(ctx, hookID, data))
+		r := safeHookResult(ctx, e.fn, hookID, data)
 		// 框架回填执行上下文(回调写入的 Block/Reason/Data 原样保留)。
 		r.Origin = &contract.Origin{ID: e.owner, Kind: contract.OriginHook, Point: hookID, At: now}
 		r.Seq = i + 1
 		out = append(out, r)
 	}
 	return out
+}
+
+// safeHookResult 执行 hook 回调,把 panic 归一成非阻断的 HookResult(机制层 fail-closed:
+// hook 回调崩了记 Reason,不炸宿主、不拦后序回调)。
+func safeHookResult(ctx context.Context, fn contract.HookFunc, hookID string, data json.RawMessage) (hr contract.HookResult) {
+	defer func() {
+		if p := recover(); p != nil {
+			hr = contract.HookResult{Reason: fmt.Sprintf("hook panic: %v", p)}
+		}
+	}()
+	return contract.HookResultOf(fn(ctx, hookID, data))
 }
