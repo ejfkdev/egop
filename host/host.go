@@ -113,6 +113,9 @@ func New[C any](opts Options[C]) *Host[C] {
 		opts.Points = NewMemPoints()
 	}
 	opts.Events.EnsureTopic(contract.EventConfigUpdated)
+	opts.Events.EnsureTopic(contract.EventPluginRegistered)
+	opts.Events.EnsureTopic(contract.EventPluginRemoved)
+	opts.Events.EnsureTopic(contract.EventPluginReplaced)
 	return &Host[C]{
 		plugins:        map[string]contract.Plugin{},
 		meta:           map[string]contract.Meta{},
@@ -130,6 +133,21 @@ func (h *Host[C]) logf(format string, args ...any) {
 	if h.opts.Logf != nil {
 		h.opts.Logf(format, args...)
 	}
+}
+
+// emitLifecycle 广播插件生命周期观察事件(plugin.registered/removed/replaced)。
+// 软依赖(DepSoft)方订阅这些主题做响应式降级;Source 为宿主(Kind=host)。
+func (h *Host[C]) emitLifecycle(topic, id, version string) {
+	if h.opts.Events == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{"plugin": id, "version": version})
+	h.opts.Events.Dispatch(context.Background(), contract.Event{
+		Type:    topic,
+		Version: contract.EnvelopeVersion,
+		Source:  &contract.Origin{Kind: contract.OriginHost, Point: topic, At: time.Now().UnixMilli()},
+		Payload: payload,
+	})
 }
 
 // Register 登记插件：DepInit 依赖、槽位八轴+Needs 校验、开点、函数目录。
@@ -151,6 +169,7 @@ func (h *Host[C]) Register(p contract.Plugin) (err error) {
 		surfaceAware.SetSurface(h.surfaceFor(m, eff))
 	}
 	h.logf("host: plugin %s registered (v%s)", m.ID, m.Version)
+	h.emitLifecycle(contract.EventPluginRegistered, m.ID, m.Version)
 	h.retryPending()
 	return nil
 }
@@ -477,8 +496,8 @@ func (h *Host[C]) slotCheck(m contract.Meta) (contract.SlotSpec, bool, []string)
 // Close 其句柄(autoload 卸载/热替换正是如此)。
 func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if _, ok := h.plugins[pluginID]; !ok {
+		h.mu.Unlock()
 		return nil, nil
 	}
 	victims := []string{pluginID}
@@ -492,13 +511,19 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 			}
 		}
 		if len(deps) > 0 {
+			h.mu.Unlock()
 			return nil, fmt.Errorf("host: remove %q refused: still required by %v (use cascade)", pluginID, deps)
 		}
 	}
-	var queue = victims
+	// 逐 victim 在删除前记录版本(供 removed 事件载荷)。
+	versions := map[string]string{}
+	queue := victims
 	for len(queue) > 0 {
 		id := queue[0]
 		queue = queue[1:]
+		if m, ok := h.meta[id]; ok {
+			versions[id] = m.Version
+		}
 		delete(h.plugins, id)
 		delete(h.meta, id)
 		delete(h.seq, id)
@@ -521,7 +546,13 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 			}
 		}
 	}
+	h.mu.Unlock()
+
 	h.logf("host: plugin %s removed (victims=%v)", pluginID, victims)
+	// 生命周期事件须在锁外广播:订阅回调可能回查宿主,持锁会死锁。
+	for _, v := range victims {
+		h.emitLifecycle(contract.EventPluginRemoved, v, versions[v])
+	}
 	return victims, nil
 }
 
@@ -564,6 +595,7 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 		surfaceAware.SetSurface(h.surfaceFor(p.Meta(), newEff))
 	}
 	h.logf("host: plugin %s replaced (v%s)", id, p.Meta().Version)
+	h.emitLifecycle(contract.EventPluginReplaced, id, p.Meta().Version)
 	h.retryPending()
 	return nil
 }

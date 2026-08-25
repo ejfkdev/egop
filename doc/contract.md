@@ -235,8 +235,10 @@ type Dependency struct {
 }
 ```
 
-- `DepInit`：硬依赖，注册顺序/拓扑排序的关键边（未满足即拒注）；
-- `DepCall`/`DepSoft`：调用期/软依赖，不影响装载序。
+- `DepInit`：硬依赖，注册顺序/拓扑排序的关键边（未满足即拒注；卸载时 fail-closed 或级联）；
+- `DepCall`：跨插件调用关系，配合 `plugin.call` 能力（声明「本插件会调用对方函数」）；
+- `DepSoft`：**软依赖**，不参与装载排序、不拦卸载——依赖方应订阅
+  `plugin.removed` / `plugin.replaced` 生命周期事件自行降级（响应式 coeffect 的声明面）。
 
 ## 8. WASM ABI
 

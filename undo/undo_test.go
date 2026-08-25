@@ -76,3 +76,28 @@ func TestCatcherNilAndDefer(t *testing.T) {
 		t.Fatalf("Defer wrapper should run once, ran %d", n)
 	}
 }
+
+func TestEffectAcquireAndRevert(t *testing.T) {
+	c := &Catcher{}
+	released := false
+	got := Effect(c, func() (int, func()) { return 42, func() { released = true } })
+	if got != 42 {
+		t.Fatalf("Effect returned %d", got)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("undo should run on Close")
+	}
+}
+
+func TestEffectNilUndo(t *testing.T) {
+	c := &Catcher{}
+	if got := Effect(c, func() (string, func()) { return "x", nil }); got != "x" {
+		t.Fatalf("Effect returned %q", got)
+	}
+	if err := c.Close(); err != nil { // nil undo 不 panic、不影响收尾
+		t.Fatal(err)
+	}
+}

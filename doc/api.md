@@ -83,6 +83,9 @@ func PointID(pluginID, pointID string) string   // "dyn.<plugin>.<point>"
 func EventID(pluginID, short string) string
 const DynamicPrefix = "dyn."
 const EventConfigUpdated = "plugin.config.updated"  // SetConfig 成功的观察事件主题
+const EventPluginRegistered = "plugin.registered"   // 插件注册(Register 成功后广播)
+const EventPluginRemoved    = "plugin.removed"      // 插件卸载(含级联 victim;软依赖方订阅降级)
+const EventPluginReplaced   = "plugin.replaced"     // 插件热替换(Replace 成功后广播)
 func WithOrigin(ctx context.Context, o *Origin) context.Context  // 注入调用来源(框架用)
 func OriginFrom(ctx context.Context) *Origin      // 被调函数读调用者(nil = 宿主/应用发起)
 ```
@@ -253,6 +256,7 @@ func RequiredFields(name string) []string
 ```go
 // undo: 统一 effect 栈(Close 时 LIFO 反序清退,错误聚合,幂等)
 type Catcher struct{}          // Add(fn func() error); Defer(fn func()); Close() error
+func Effect[T any](c *Catcher, acquire func() (T, func())) T // 获取即注册撤销(对应 cordis ctx.effect)
 // exchange: 信封翻译表
 func Register(name string, proto any)
 func NewEvent(point string, payload any, subTypeHint string) contract.Event

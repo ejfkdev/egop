@@ -52,3 +52,13 @@ func (c *Catcher) Close() error {
 	}
 	return errors.Join(errs...)
 }
+
+// Effect 执行 acquire 取资源并登记其撤销,返回资源——"获取即注册撤销"的方便面
+// (对应 cordis 的 ctx.effect)。Close 时按 Catcher 反序执行撤销。
+func Effect[T any](c *Catcher, acquire func() (T, func())) T {
+	v, undo := acquire()
+	if undo != nil {
+		c.Defer(undo)
+	}
+	return v
+}

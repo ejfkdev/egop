@@ -207,8 +207,12 @@ type ConfigFieldSpec struct {
 type DependencyKind string
 
 const (
+	// DepInit 硬依赖:注册时须已就位,卸载时 fail-closed 或级联(连坐)。
 	DepInit DependencyKind = "init"
+	// DepCall 跨插件调用关系:声明「本插件会调用对方函数」,配合 plugin.call 能力。
 	DepCall DependencyKind = "call"
+	// DepSoft 软依赖:不参与装载排序、不拦卸载;依赖方应订阅 plugin.removed 等
+	// 生命周期事件自行降级(响应式 coeffect 的声明面)。
 	DepSoft DependencyKind = "soft"
 )
 
@@ -476,6 +480,15 @@ type Disposer interface {
 // EventConfigUpdated 是宿主下发配置成功的观察事件主题
 // (payload = {"plugin":id,"config":cfg};经 Events 总线广播)。
 const EventConfigUpdated = "plugin.config.updated"
+
+// EventPluginRegistered / EventPluginRemoved / EventPluginReplaced 是宿主插件
+// 生命周期观察事件主题(payload = {"plugin":id,"version":v})。软依赖(DepSoft)方
+// 订阅这些主题做响应式降级(对应 cordis 的"响应式 coeffect":上下文变化即通知)。
+const (
+	EventPluginRegistered = "plugin.registered"
+	EventPluginRemoved    = "plugin.removed"
+	EventPluginReplaced   = "plugin.replaced"
+)
 
 // HasCapability 声明判定。
 func HasCapability(m Meta, cap string) bool {
