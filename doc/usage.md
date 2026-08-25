@@ -85,6 +85,27 @@ _ = h.SetConfig("demo.cfg", json.RawMessage(`{"level":3}`))      // 接受
 `SetConfig` 成功后经默认事件总线广播 `plugin.config.updated`
 （payload `{"plugin":id,"config":cfg}`）。
 
+**写语义**：`host.SetConfig(id, cfg)` 是**整对象替换**（每次覆盖整份生效配置）；
+`host.SetConfigField(id, key, value)` 是**合并单字段**（读旧值→补 key→整对象下发）——
+web 配置界面按字段保存用后者，全量表单提交用前者。`Surface.SetConfig(id, key, value)`
+是带能力门控的单字段合并。
+
+**读语义（权威读回）**：插件实现 `contract.ConfigProvider`（`Config() json.RawMessage`）时，
+`host.EffectiveConfig(id)` 优先读它（覆盖默认值补齐/归一化/脱敏后的真值），未实现则回退
+`host.applied`（宿主推过的原始 delta）;`host.GetConfig(id, key)`/`Surface.GetConfig` 读的就是
+`EffectiveConfig` 的对应字段。配置声明里 `ConfigFieldSpec.Default` 是**声明级默认值**（供 UI
+展示/回填），运行时真实默认以插件的 `Config()` 为准。
+
+```go
+// 插件实现 Config 读回其当前生效配置(web 界面拿它显示真实状态;可对 secret 脱敏)
+type cfg struct{ level int }
+func (c *cfg) ApplyConfig(raw json.RawMessage) error { _ = json.Unmarshal(raw, &struct{ Level *int `json:"level"` }{&c.level}); return nil }
+func (c *cfg) Config() json.RawMessage { return json.RawMessage(fmt.Sprintf(`{"level":%d}`, c.level)) }
+
+got, _ := h.EffectiveConfig("demo.cfg")          // 优先 Config();未实现回退 applied
+_ = h.SetConfigField("demo.cfg", "level", json.RawMessage(`5`)) // 合并,保留其它字段
+```
+
 **跨插件配置读写权限**：`ConfigFieldSpec` 里的 `Readable`/`Writable` 控制「别的插件
 能不能读/写这个字段」（egop 始终可读写），配合 `config.read`/`config.write` 能力词——
 两层都满足才放行。

@@ -19,7 +19,7 @@ type SlotSpec struct { ID, Doc; Provides, Hooks, Events, Functions, Capabilities
 type FuncSpec struct { Name, Description string; Input, Output json.RawMessage }
 type HookPointSpec struct { ID string; Kind HookKind; Desc string; Payload, Result json.RawMessage }
 type EventTopicSpec struct { ID, Description string; Payload json.RawMessage }
-type ConfigFieldSpec struct { Key, Description string; Schema json.RawMessage;
+type ConfigFieldSpec struct { Key, Description string; Schema, Default json.RawMessage;
     Readable, Writable, Secret bool }
 type Dependency struct { Plugin, Slot string; Kind DependencyKind; MinVersion string }
 type ResultEnvelope struct { OK bool; Result json.RawMessage; ResultB64, Error, Type string; At int64; Meta json.RawMessage }
@@ -45,7 +45,7 @@ type HookFunc func(ctx, hookID string, data json.RawMessage) any  // 返回 Hook
 type HookResult struct { Block bool; Reason string; Data json.RawMessage; Origin *Origin; Seq int } // Block/Reason/Data 回调写;Origin/Seq 框架填
 func HookResultOf(v any) HookResult  // 归一:直接数据(nil/RawMessage/[]byte/string/值)→HookResult{Data};HookResult 原样
 type Configurable interface { ApplyConfig(cfg json.RawMessage) error }
-type ConfigProvider interface { Config() json.RawMessage }
+type ConfigProvider interface { Config() json.RawMessage }  // 权威读回(默认/归一/脱敏)
 type SurfaceAware interface { SetSurface(e Surface) }
 type Disposer interface { Close(ctx) error }
 ```
@@ -99,8 +99,10 @@ type HostFace interface {
     Remove(pluginID string, cascade bool) ([]string, error)
     HasPlugin(id string) bool
     Plugins() []contract.Meta
-    SetConfig(pluginID string, cfg json.RawMessage) error
-    AppliedConfig(pluginID string) (json.RawMessage, bool)
+    SetConfig(pluginID string, cfg json.RawMessage) error   // 整对象替换
+    SetConfigField(pluginID, key string, value json.RawMessage) error  // 合并单字段
+    AppliedConfig(pluginID string) (json.RawMessage, bool)  // 宿主推过的缓存
+    EffectiveConfig(pluginID string) (json.RawMessage, bool) // 权威读回:ConfigProvider 优先,回退 applied
     SurfaceFor(pluginID string) (contract.Surface, bool)
     Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error)
 }

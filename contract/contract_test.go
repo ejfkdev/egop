@@ -255,3 +255,24 @@ func TestHasCapabilityAndNamespaceIDs(t *testing.T) {
 		t.Fatalf("namespace ids: %q %q", PointID("p", "x"), EventID("p", "evt"))
 	}
 }
+
+func TestConfigFieldSpecRoundTrip(t *testing.T) {
+	// 配置字段声明(含 Default/Secret/Read-Write 标志)在 JSON 上往返不丢。
+	m := Meta{Provides: Provides{Config: []ConfigFieldSpec{{
+		Key: "api_key", Description: "key", Schema: json.RawMessage(`{"type":"string"}`),
+		Default: json.RawMessage(`"https://default"`), Writable: true, Secret: true,
+	}}}}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Meta
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	f := back.Provides.Config[0]
+	if !f.Writable || !f.Secret || string(f.Default) != `"https://default"` ||
+		string(f.Schema) != `{"type":"string"}` {
+		t.Fatalf("config field lost: %+v", f)
+	}
+}

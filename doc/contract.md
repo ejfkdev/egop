@@ -134,7 +134,8 @@ api.md 的 Surface 能力面；每条能力的门控语义见 usage.md 的"ctx �
 ### 配置字段读写权限
 
 插件用 `Provides.Config` 声明可下发字段，`ConfigFieldSpec` 带两个**跨插件**访问标志
-（`egop`/宿主始终可读写）：
+（`egop`/宿主始终可读写），另有 `Schema`（每字段 JSON Schema）、`Default`（声明级默认值，
+供 UI 展示/回填）、`Secret`（敏感标记，展示/日志应脱敏）：
 
 | 标志 | 语义 | 默认 |
 |---|---|---|
@@ -145,7 +146,11 @@ api.md 的 Surface 能力面；每条能力的门控语义见 usage.md 的"ctx �
 字段 `Writable:true, Readable:false`：egop 可读写，别的插件只能写入、读不回。
 
 跨插件访问经 `Surface.GetConfig(pluginID, key)`（读）/ `Surface.SetConfig(pluginID, key, value)`
-（写）；egop/宿主读整份生效配置走 `Host.AppliedConfig`/`Host.GetConfig`。
+（写，单字段合并）。**写语义**：`Host.SetConfig(id, cfg)` 是整对象替换；`Host.SetConfigField` 是
+单字段合并。**读语义（权威读回）**：插件实现 `ConfigProvider`（`Config() json.RawMessage`）时，
+`Host.EffectiveConfig(id)` 优先读它（含默认值补齐/归一化/脱敏后的真值），未实现回退
+`Host.AppliedConfig`（宿主推过的原始 delta）；`Host.GetConfig`/`Surface.GetConfig` 读的是
+`EffectiveConfig` 的对应字段。
 
 ### 插件目录与元数据
 

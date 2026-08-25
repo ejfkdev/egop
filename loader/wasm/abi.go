@@ -40,6 +40,9 @@ const (
 	ExportTool = "egop_tool"
 	// ExportApplyConfig 配置下发(SetConfig)。
 	ExportApplyConfig = "egop_apply_config"
+	// ExportGetConfig 读回当前生效配置(ConfigProvider.Config;返回裸 JSON (ptr,len),
+	// 未导出则宿主回退 applied 缓存)。
+	ExportGetConfig = "egop_get_config"
 	// ExportOnEvent 事件推送回调(宿主调 guest;无返回、尽力而为)。
 	ExportOnEvent = "egop_on_event"
 	// ExportOnHook hook 回调触发(宿主调 guest;返回 HookResult 信封)。

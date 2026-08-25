@@ -80,3 +80,33 @@ func TestParseZipAssets(t *testing.T) {
 		t.Fatal("assets should not include missing")
 	}
 }
+
+func TestConfigExportReadback(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "config.egop.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadFS(context.Background(), b, "config.egop.wasm", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close(context.Background())
+	if got := p.Config(); string(got) != `{"api_url":"https://default","max_results":10}` {
+		t.Fatalf("Config() = %s", got)
+	}
+}
+
+func TestConfigExportAbsentReturnsNil(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "demo.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadFS(context.Background(), b, "demo.egop.wasm", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close(context.Background())
+	if p.Config() != nil {
+		t.Fatalf("Config() should be nil when egop_get_config absent, got %s", p.Config())
+	}
+}

@@ -863,12 +863,47 @@ func (h *Host[C]) AppliedConfig(pluginID string) (json.RawMessage, bool) {
 	return v, ok
 }
 
-// GetConfig 读某插件生效配置里的单个字段(egop 层读;无能力门控。跨插件读经
-// Surface.GetConfig 施加 config.read + Readable 两层门控)。
-func (h *Host[C]) GetConfig(pluginID, key string) (json.RawMessage, bool) {
+// EffectiveConfig 读插件**当前生效配置**:优先 ConfigProvider.Config()(权威,含默认/
+// 归一化/脱敏),未实现或 panic 则回退宿主缓存 applied。这是 web 配置界面应读的"真值"。
+func (h *Host[C]) EffectiveConfig(pluginID string) (json.RawMessage, bool) {
 	h.mu.Lock()
-	raw, ok := h.applied[pluginID]
+	p, ok := h.plugins[pluginID]
+	applied, has := h.applied[pluginID]
 	h.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	if cp, ok := p.(contract.ConfigProvider); ok {
+		if cfg := safeConfig(cp); cfg != nil {
+			return cfg, true
+		}
+	}
+	return applied, has
+}
+
+// SetConfigField 合并单字段进整份生效配置(读旧 applied→补 key→整对象下发)。egop 层
+// 无能力门控(UI/装配层单字段保存用);与 SetConfig(整对象替换)区别开。
+func (h *Host[C]) SetConfigField(pluginID, key string, value json.RawMessage) error {
+	h.mu.Lock()
+	raw, _ := h.applied[pluginID]
+	h.mu.Unlock()
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &obj)
+	}
+	obj[key] = value
+	full, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	return h.SetConfig(pluginID, full)
+}
+
+// GetConfig 读某插件生效配置里的单个字段(egop 层读;无能力门控。跨插件读经
+// Surface.GetConfig 施加 config.read + Readable 两层门控)。读的是 EffectiveConfig
+// (ConfigProvider 优先,未实现回退 applied)。
+func (h *Host[C]) GetConfig(pluginID, key string) (json.RawMessage, bool) {
+	raw, ok := h.EffectiveConfig(pluginID)
 	if !ok {
 		return nil, false
 	}
@@ -1165,18 +1200,5 @@ func (e *plugSurface[C]) SetConfig(pluginID, key string, value json.RawMessage) 
 	if !e.h.configFieldAllowed(pluginID, key, false) {
 		return fmt.Errorf("plugin %s: config field %s.%s not writable by plugins", e.meta.ID, pluginID, key)
 	}
-	h := e.h
-	h.mu.Lock()
-	raw, _ := h.applied[pluginID]
-	h.mu.Unlock()
-	obj := map[string]json.RawMessage{}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &obj)
-	}
-	obj[key] = value
-	full, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	return h.SetConfig(pluginID, full)
+	return e.h.SetConfigField(pluginID, key, value)
 }

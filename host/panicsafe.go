@@ -5,6 +5,7 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/ejfkdev/egop/contract"
@@ -16,6 +17,12 @@ func fromPanic(errp *error, what string) {
 	if r := recover(); r != nil {
 		*errp = fmt.Errorf("host: %s panicked: %v", what, r)
 	}
+}
+
+// safeConfig 执行 ConfigProvider.Config() 并把 panic 归一为 nil(读配置失败回退 applied)。
+func safeConfig(cp contract.ConfigProvider) (cfg json.RawMessage) {
+	defer func() { _ = recover() }()
+	return cp.Config()
 }
 
 // closeDisposer 执行 Disposer.Close 并把 panic 归一到 error(Close 是插件代码——

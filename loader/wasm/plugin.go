@@ -51,6 +51,32 @@ func (p *Plugin) recordUnsub(fn func()) { p.unsubs.Defer(fn) }
 // Meta 实现 base.Plugin。
 func (p *Plugin) Meta() contract.Meta { return p.manifest.Meta }
 
+// Config 实现 contract.ConfigProvider:调 guest 的 egop_get_config 导出读回当前生效
+// 配置(权威读回);未导出/失败返回 nil → 宿主 EffectiveConfig 回退 applied 缓存。
+func (p *Plugin) Config() json.RawMessage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.broken.Load() || p.mod == nil {
+		return nil
+	}
+	fn := p.mod.ExportedFunction(ExportGetConfig)
+	if fn == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), applyConfigTimeout)
+	defer cancel()
+	results, err := fn.Call(ctx)
+	if err != nil || len(results) != 1 {
+		return nil
+	}
+	ptr, ln := unpack(results[0])
+	s, err := readGuestString(p.mod.Memory(), ptr, ln)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(s)
+}
+
 // CallFunc 实现 base.FunctionProvider。
 func (p *Plugin) CallFunc(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
 	p.mu.Lock()

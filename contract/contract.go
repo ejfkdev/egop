@@ -195,6 +195,9 @@ type ConfigFieldSpec struct {
 	Key         string          `json:"key"`
 	Description string          `json:"description,omitempty"`
 	Schema      json.RawMessage `json:"schema,omitempty"`
+	// Default 字段默认值(纯声明,供控制面/UI 展示与回填;运行时**真实**默认以插件的
+	// ConfigProvider.Config() 返回为准)。
+	Default json.RawMessage `json:"default,omitempty"`
 	// Readable/Writable 是**跨插件**访问控制(egop/宿主始终可读写)。默认 false:
 	// 其它插件不可读/不可写;要开放才设 true。调用方还需声明 config.read 或
 	// config.write 能力,两项同时满足才放行。
@@ -300,6 +303,9 @@ type Configurable interface {
 	ApplyConfig(cfg json.RawMessage) error
 }
 
+// ConfigProvider 可选:插件自述**当前生效配置**(权威读回,与 Configurable.ApplyConfig
+// 成对的"读"面)。宿主读配置优先走它,未实现则回退 host.applied 缓存——它覆盖了
+// 默认值补齐/归一化/脱敏后的真值(web 配置界面拿它显示真实状态)。
 type ConfigProvider interface {
 	Config() json.RawMessage
 }
