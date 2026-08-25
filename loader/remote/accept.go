@@ -131,11 +131,11 @@ func ServePluginStream(ctx context.Context, stream Stream, mf contract.Manifest,
 	manifestJSON, err := json.Marshal(mf)
 	if err != nil {
 		sess.Close()
-		return nil
+		return fmt.Errorf("marshal manifest: %w", err)
 	}
 	if err := sendFrame(stream, &Frame{Id: f.Id, Reply: true, Kind: KindRegister, Manifest: manifestJSON}); err != nil {
 		sess.Close()
-		return nil
+		return fmt.Errorf("register reply: %w", err)
 	}
 	<-sess.Done()
 	return nil
@@ -192,7 +192,7 @@ func ServeStream(ctx context.Context, rh RemoteHost, stream Stream, token string
 		// 注册已成功但回执发送失败:主动卸载,避免留下一个回不了话的死会话挂在宿主上。
 		_, _ = rh.Remove(mf.ID, false)
 		sess.Close()
-		return nil
+		return fmt.Errorf("register reply: %w", err)
 	}
 	sess.OnClosed(func(err error) {
 		if _, rerr := rh.Remove(mf.ID, false); rerr != nil {

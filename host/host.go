@@ -150,6 +150,17 @@ func (h *Host[C]) emitLifecycle(topic, id, version string) {
 	})
 }
 
+// injectSurface 向插件注入能力面视图;SetSurface 属插件代码,panic 归一为日志
+// (注册/替换已入册,面注入 best-effort,不 crash 宿主)。
+func (h *Host[C]) injectSurface(sa contract.SurfaceAware, id string, s contract.Surface) {
+	defer func() {
+		if p := recover(); p != nil {
+			h.logf("host: plugin %s SetSurface panicked: %v", id, p)
+		}
+	}()
+	sa.SetSurface(s)
+}
+
 // Register 登记插件：DepInit 依赖、槽位八轴+Needs 校验、开点、函数目录。
 func (h *Host[C]) Register(p contract.Plugin) (err error) {
 	m := p.Meta()
@@ -166,7 +177,7 @@ func (h *Host[C]) Register(p contract.Plugin) (err error) {
 	// 能力门控 Surface 注入在锁外:插件 SetSurface 里可能回查宿主(Plugins/Call/…),
 	// 若在 h.mu 内调用会死锁。
 	if surfaceAware != nil {
-		surfaceAware.SetSurface(h.surfaceFor(m, eff))
+		h.injectSurface(surfaceAware, m.ID, h.surfaceFor(m, eff))
 	}
 	h.logf("host: plugin %s registered (v%s)", m.ID, m.Version)
 	h.emitLifecycle(contract.EventPluginRegistered, m.ID, m.Version)
@@ -592,7 +603,7 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 	}
 	// 同 Register:SetSurface 在锁外,插件可在其中回查宿主而不死锁。
 	if surfaceAware != nil {
-		surfaceAware.SetSurface(h.surfaceFor(p.Meta(), newEff))
+		h.injectSurface(surfaceAware, id, h.surfaceFor(p.Meta(), newEff))
 	}
 	h.logf("host: plugin %s replaced (v%s)", id, p.Meta().Version)
 	h.emitLifecycle(contract.EventPluginReplaced, id, p.Meta().Version)
@@ -912,11 +923,15 @@ func (h *Host[C]) Tools() []Tool[C] {
 		if !ok || !contract.HasCapability(h.meta[id], contract.CapTools) {
 			continue
 		}
-		for _, spec := range tp.ToolSpecs() {
-			if fn, ok := tp.Tool(spec.Name); ok {
-				out = append(out, Tool[C]{Spec: spec, run: fn, pluginID: id, host: h})
+		// 工具面收集 best-effort:坏工具声明/生成 panic 跳过该插件,不 crash 宿主。
+		func() {
+			defer func() { _ = recover() }()
+			for _, spec := range tp.ToolSpecs() {
+				if fn, ok := tp.Tool(spec.Name); ok {
+					out = append(out, Tool[C]{Spec: spec, run: fn, pluginID: id, host: h})
+				}
 			}
-		}
+		}()
 	}
 	// 与 Plugins()/Functions() 一致:按 plugin.tool 键排序,输出确定(插件 map 遍历无序)。
 	sort.Slice(out, func(i, j int) bool {

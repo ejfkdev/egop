@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 
@@ -30,6 +31,9 @@ type Stream interface {
 // maxFrameSize 单帧上限(防御性)。
 const maxFrameSize = 64 << 20 // 64MiB
 
+// ErrFrameTooLarge 表示对端发来的帧超过 maxFrameSize(错误归类为"帧过大",而非误报 EOF)。
+var ErrFrameTooLarge = errors.New("remote: frame too large")
+
 // BindStream 把一段字节双向流(rw)适配成 Stream(4 字节大端长度前缀 + 载荷)。
 // 外部 transport 只需提供读写字节(如 net.Conn、WebSocket 包装、HTTP/2 双向体、
 // 浏览器消息通道)。
@@ -49,8 +53,14 @@ func (b *byteStream) Send(data []byte) error {
 	copy(buf[4:], data)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	_, err := b.rw.Write(buf)
-	return err
+	n, err := b.rw.Write(buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) { // 短写即帧被截断(长度前缀与载荷失衡),显式报错而非常默认 lenient 传输吞掉。
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func (b *byteStream) Recv() ([]byte, error) {
@@ -60,7 +70,7 @@ func (b *byteStream) Recv() ([]byte, error) {
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
 	if n > maxFrameSize {
-		return nil, io.ErrUnexpectedEOF
+		return nil, ErrFrameTooLarge
 	}
 	data := make([]byte, n)
 	if _, err := io.ReadFull(b.rw, data); err != nil {

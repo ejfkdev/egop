@@ -85,3 +85,36 @@ func TestEventSubscriberPanicIsolated(t *testing.T) {
 		t.Fatalf("second subscriber should still fire, got %d", second)
 	}
 }
+
+type panicSurfacePlugin struct{ meta contract.Meta }
+
+func (p *panicSurfacePlugin) Meta() contract.Meta         { return p.meta }
+func (p *panicSurfacePlugin) SetSurface(contract.Surface) { panic("boom-surface") }
+
+func TestSetSurfacePanicIsolated(t *testing.T) {
+	h := New[any](Options[any]{})
+	// SetSurface panic 不 crash 注册;插件照常入册(面注入 best-effort)。
+	if err := h.Register(&panicSurfacePlugin{meta: contract.Meta{ID: "s", Name: "S", Version: "1"}}); err != nil {
+		t.Fatalf("register should not error on SetSurface panic: %v", err)
+	}
+	if !h.HasPlugin("s") {
+		t.Fatal("plugin should still be registered")
+	}
+}
+
+type panicToolSpecsPlugin struct{ meta contract.Meta }
+
+func (p *panicToolSpecsPlugin) Meta() contract.Meta            { return p.meta }
+func (p *panicToolSpecsPlugin) ToolSpecs() []contract.FuncSpec { panic("boom-specs") }
+func (p *panicToolSpecsPlugin) Tool(string) (contract.ToolFunc[struct{}], bool) {
+	return nil, false
+}
+
+func TestToolsPanicIsolated(t *testing.T) {
+	h := New[struct{}](Options[struct{}]{})
+	_ = h.Register(&panicToolSpecsPlugin{meta: contract.Meta{ID: "ts", Name: "TS", Version: "1",
+		Provides: contract.Provides{Capabilities: []string{contract.CapTools}}}})
+	if got := h.Tools(); len(got) != 0 {
+		t.Fatalf("tools = %d (want 0 after ToolSpecs panic)", len(got))
+	}
+}
