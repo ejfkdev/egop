@@ -9,7 +9,7 @@
 ```go
 type Meta struct { ID, Name, Version, Description; Homepage, License string;
     Authors, Tags []string; Provides Provides; Requires Requires; Slot string;
-    DependsOn []string }
+    DependsOn []string; Extensions map[string]json.RawMessage }  // Extensions=自由扩展键值(开发者自约定,egop 不解释)
 type Provides struct { Points, Capabilities []string; Hooks []HookPointSpec;
     Events []EventTopicSpec; Functions []FuncSpec; Config []ConfigFieldSpec }
 type Requires struct { Listens []string; Deps []Dependency; Tools []string }

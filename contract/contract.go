@@ -261,6 +261,11 @@ type Meta struct {
 	Slot     string   `json:"slot,omitempty"`
 
 	DependsOn []string `json:"depends_on,omitempty"` // 遗留纯声明
+
+	// Extensions 自由扩展键值(非契约轴,完全由开发者自行约定;egop 不解释、不校验,
+	// 只在 JSON 契约里原样透传——供目录/控制面/其它插件按 key 读取自定义能力声明、
+	// 业务元数据等)。值是否 JSON 由开发者约定,egop 不做格式约束。
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 // Manifest 线上清单：Meta 平铺 + 工具声明（与函数共用 FuncSpec 型）。

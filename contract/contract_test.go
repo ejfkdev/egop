@@ -276,3 +276,34 @@ func TestConfigFieldSpecRoundTrip(t *testing.T) {
 		t.Fatalf("config field lost: %+v", f)
 	}
 }
+
+func TestMetaExtensionsRoundTrip(t *testing.T) {
+	// 自由扩展键值(Extentions):任意 key → 任意 JSON 值,egop 不解释、原样透传。
+	m := Meta{
+		ID: "p.x", Name: "X", Version: "1",
+		Extensions: map[string]json.RawMessage{
+			"custom.capability": json.RawMessage(`"my.word"`),
+			"ui.order":          json.RawMessage(`10`),
+			"badge":             json.RawMessage(`{"logo":"https://x/logo.png","color":"#fff"}`),
+		},
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Meta
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Extensions) != 3 ||
+		string(back.Extensions["custom.capability"]) != `"my.word"` ||
+		string(back.Extensions["ui.order"]) != `10` ||
+		string(back.Extensions["badge"]) != `{"logo":"https://x/logo.png","color":"#fff"}` {
+		t.Fatalf("extensions lost: %+v", back.Extensions)
+	}
+	// 未设置时不落 JSON(omitempty)。
+	zb, _ := json.Marshal(Meta{ID: "x"})
+	if strings.Contains(string(zb), "extensions") {
+		t.Fatalf("zero extensions must be omitted: %s", zb)
+	}
+}

@@ -31,11 +31,17 @@ type Meta struct {
     Requires Requires // 依赖面
     Slot     string   // 声称实现的槽位
     DependsOn []string // 遗留纯声明依赖(展示/排序用,非强制校验轴)
+    Extensions map[string]json.RawMessage // 自由扩展键值(非契约轴,开发者自约定,egop 不解释)
 }
 ```
 
 `Homepage`/`License`/`Authors`/`Tags` 是**描述性元数据**（非契约轴，供目录、控制面展示与检索），
 均 `omitempty`，旧清单不带它们也照常解析。
+
+`Extensions` 是**自由扩展键值**：任意 `key` → 任意 JSON 值，完全由开发者自行约定，
+egop **不解释、不校验、不参与任何轴求差**，只在 JSON 契约里原样透传（供目录/控制面/
+其它插件按 key 读取自定义能力声明、业务元数据、UI 提示等）。这是给「没被固定字段覆盖的
+自定义含义」留的口子——egop 内容无关、不做格式约束。
 
 **Provides（我提供什么）**：
 
