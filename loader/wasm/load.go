@@ -139,7 +139,11 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 			return fmt.Errorf("wasm plugin %s: unknown host import %q.%q", p.name, modName, fName)
 		}
 	}
-	cfg := wazero.NewModuleConfig().WithName(p.name)
+	// Go wasip1 插件用 reactor 模式(-buildmode=c-shared)导出 _initialize、command 模式
+	// 导出 _start,WAT 手写插件可能两者皆无。wazero 对列表里不存在的 start 函数是宽容
+	// 跳过的,故直接按"reactor 优先、command 兜底"列出——保证 Go 插件的 init/运行时在
+	// egop_meta 之前被初始化(否则 Go 插件拿不到注册实例)。
+	cfg := wazero.NewModuleConfig().WithName(p.name).WithStartFunctions("_initialize", "_start")
 	mod, err := r.InstantiateModule(ctx, compiled, cfg)
 	if err != nil {
 		return fmt.Errorf("wasm plugin %s: instantiate: %w", p.name, err)
