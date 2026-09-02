@@ -74,6 +74,7 @@ type FuncSpec struct {
     Description string          `json:"description,omitempty"`
     Input       json.RawMessage `json:"input,omitempty"`  // 入参 JSON Schema
     Output      json.RawMessage `json:"output,omitempty"` // 返回 JSON Schema
+    Extensions  map[string]json.RawMessage `json:"extensions,omitempty"` // 自由扩展键值(与 Meta.Extensions 同构,egop 不解释)
 }
 ```
 
@@ -126,6 +127,8 @@ typed 包装永远在消费方装配层。
 | `CapKV` | `storage.kv` | 插件专属 KV |
 | `CapExec` | `exec.cmd` | 执行命令 |
 | `CapNet` | `net.access` | 出站网络(HTTP/HTTPS/SSE/WebSocket/WebTransport 等,经 Net 注入) |
+| `CapFSRead` | `fs.read` | 全局文件系统读取(经 FS 注入;区别于 `storage.persist` 的插件专属隔离目录) |
+| `CapFSWrite` | `fs.write` | 全局文件系统写入(同上;读写分别门控) |
 | `CapTools` | `tool.provide` | 向工具面提供工具 |
 | `CapConfigRead` | `config.read` | 读其它插件的声明配置字段 |
 | `CapConfigWrite` | `config.write` | 写其它插件的声明配置字段 |
@@ -187,6 +190,17 @@ DataChannel/WebTransport/MQTT-over-WS）统一走 `Net.DialStream`（URL scheme 
 `file://`、`data:`、`javascript:`、裸路径、协议相对 `//host`、空 URL 一律拒绝。
 这防止插件借用出站网络后端把 `io.Reader`/`Stream` 接到本地文件系统，与
 "先说后做"同属第一道防线。
+
+### 全局文件系统
+
+`Surface.FS()`（`fs.read` / `fs.write`）提供插件对**宿主文件系统的一个显式受控
+视图**——与 `storage.persist`（插件专属隔离目录）互补：装配层实现 `contract.FS`
+（`ReadFile`/`WriteFile` 两法）并从 `host.Options.FS` 注入，可见范围/沙箱/路径
+白名单策略**完全由实现决定**（可给 `io/fs.Sub` 子树视图、只读镜像等；egop 不实现
+任何平台 IO）。读写按声明**分向门控**（宿主 `fsGuard` 单点强制）：只声明 `fs.read`
+者 `WriteFile` 报错，反之亦然；两者都未声明或后端未注入时 `FS()` 返回不可用。
+跨世界同构：wasm ABI `fs_read`/`fs_write` 与远程通道 `OpFSRead`/`OpFSWrite` 走
+同一门控视图。
 
 ### 溯源 Origin
 
@@ -263,13 +277,26 @@ type Dependency struct {
 | `egop_call` | 声明了 functions 时必需 | 条件 |
 | `egop_tool` | 声明了 tools 时必需 | 条件 |
 | `egop_apply_config` | 可下发配置 | 可选 |
+| `egop_get_config` | 当前生效配置权威读回（裸 JSON；缺省回退宿主 applied 缓存） | 可选 |
 | `egop_on_event` | 事件推送回调（入参是完整 `contract.Event` JSON） | 可选 |
+| `egop_on_hook` | hook 触发回调（返回 HookResult 信封） | 可选 |
 | `egop_shutdown` | 卸载钩子 | 可选 |
 
-参数/返回约定：字符串 = guest 内存 `(ptr,len)` 成对；除 `egop_meta`（裸 JSON）与
-`egop_on_event`（无返回）外，均返回结果信封 `(ptr,len)`。事件/过滤统一：
-`publish_event` 入参 = 完整 `contract.Event` JSON，`subscribe_event` 入参 = 完整
-`contract.EventFilter` JSON（与进程内 `Surface.Publish`/`SubscribeEventFilter` 同构）。
+参数/返回约定：字符串 = guest 内存 `(ptr,len)` 成对；除 `egop_meta` /
+`egop_get_config`（裸 JSON）与 `egop_on_event`（无返回）外，均返回结果信封
+`(ptr,len)`。事件/过滤统一：`publish_event` 入参 = 完整 `contract.Event` JSON，
+`subscribe_event` 入参 = 完整 `contract.EventFilter` JSON（与进程内
+`Surface.Publish`/`SubscribeEventFilter` 同构）。
+
+**溯源双形状**：`egop_call` / `egop_on_hook` 各支持两种签名——4 个 i32 参数
+（旧版两参对）或 6 个（第三参对 = 调用/触发来源 `Origin` 裸 JSON，guest SDK 经
+`contract.WithOrigin` 还原进 ctx）。宿主按导出精确元数选择传参；其它元数在装载期
+按 ABI 不合规拒载。
+
+**投递重入语义**：`egop_on_event` / `egop_on_hook` 的宿主侧投递经 `TryLock`——
+guest 实例忙（正执行调用，含"插件发布命中自身订阅的事件"这类同 goroutine 同步
+扇出重入）时本次投递跳过（事件丢弃 / hook 记 `Reason`），绝不阻塞取锁造成对
+非重入实例锁的自死锁。
 
 ### 宿主注入（module `egop`）
 
@@ -277,26 +304,39 @@ type Dependency struct {
 `persist_list` / `kv_get` / `kv_put` / `kv_delete` / `kv_keys` / `exec` /
 `op`（通用扩展：op 名 + 入参）/ `publish_event` / `subscribe_event` / `on_hook`
 （hook）/ `plugins` / `get_plugin`（plugin.meta 目录/元数据）/ `get_config` /
-`set_config`（config.read/write 跨插件配置）/ `read_asset` / `log`。
+`set_config`（config.read/write 跨插件配置）/ `read_asset` / `fs_read` /
+`fs_write`（fs.read/write 全局文件系统）/ `net_request` / `net_body_read` /
+`net_body_close`（net.access 出站网络：整包请求上线、响应 body 流式读回、句柄
+显式关闭）/ `log`。
 
 返回 `i64` = `(len<<32)|ptr`，指向经 `egop_host_alloc` 分配的结果信封。
 
-### 清单来源
+### 清单来源与包形态
 
 - `.egop.wasm`：优先读自定义段 `egop.manifest`；缺省回退 `egop_meta` 导出。
-- `.egop.zip`：`manifest.json` + `plugin.wasm` + `assets/*`。
+- `.egop.zip`：`manifest.json`（必需）+ `plugin.wasm`（可选）+ `assets/*`（可选）。
+  `plugin.wasm` 缺省 = **无代码插件**（纯清单/资产，如 UI 插件）：宿主经
+  `Meta()`/`Assets()` 消费，不执行任何 guest 代码；声明函数/工具/配置/hook 点
+  等需要代码兑现的面会被 fail-closed 拒载。
+- 其它后缀的 zip 包（品牌/项目自有约定）经 `wasm.Options.ExtraSuffixes` 装配
+  注入，内容布局与 `.egop.zip` 相同——内容无关库不内置任何业务品牌词。
+- zip 解压设上限（`Options.MaxEntryBytes` / `MaxTotalBytes`，默认单条目 256MiB /
+  整包 1GiB；头部声明预检 + 读取硬限双重），资产名拒绝绝对路径与 `..` 穿越。
 
 ## 9. 远程通道帧（loader/remote）
 
-远程通道不再绑定传输：egop 只在注入的 `remote.Stream` 上收发 **JSON 帧**，payload
+远程通道不绑定传输：egop 只在注入的 `remote.Stream` 上收发 **JSON 帧**，payload
 一律结果信封 JSON（无第二种编码）。帧结构即 `loader/remote.Frame`：
 
 `kind`：`register` / `call_func` / `tool` / `hook` / `apply_config` / `host_call` /
 `subscribe` / `push_event` / `shutdown` / `ping`。
 
 - 请求/回复按 `id` 关联；单向帧（push_event / shutdown）`id=0`；
-- 插件→框架：`HostCall`（能力回程，op 词汇同 wasm 宿主注入）+ `Subscribe`（帧内
+- 插件→框架：`HostCall`（能力回程，op 词汇同 wasm 宿主注入——含 `fs_read`/
+  `fs_write`/`net_request`/`net_body_read`/`net_body_close`）+ `Subscribe`（帧内
   承载完整 `contract.EventFilter`）；
 - 框架→插件：`CallFunc` / `Tool` / `Hook` / `ApplyConfig` / `PushEvent` / `Shutdown`——
   `PushEvent` 帧承载完整 `contract.Event`（Type/SubType/Labels/Source/Payload）；
+  `call_func` / `hook` 帧带 `origin` 字段（调用/触发来源，与 wasm 溯源双形状同款
+  语义；插件侧还原进处理 ctx，旧对端不认识该字段即自然忽略——加性演进）；
 - 传输实现（http/https/websocket/裸字节流）由外部注入，`remote.BindStream` 做帧化。

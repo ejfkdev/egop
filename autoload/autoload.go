@@ -56,13 +56,17 @@ type Options struct {
 	Interval time.Duration                 // 轮询周期;0 = 1s
 	Logf     func(format string, a ...any) // 生命周期日志;nil = 静默
 	FS       fs.FS                         // 注入的只读文件系统(内嵌/浏览器用);nil = 操作系统目录
+	// ExtraSuffixes 追加的插件 zip 包后缀(透传 wasm.Options.ExtraSuffixes;
+	// 品牌/项目自有后缀由装配注入,内容无关库不内置业务词)。
+	ExtraSuffixes []string
 }
 
 // dot 是一个目录下的一行文件观察。
 type unit struct {
 	path    string // 规格化路径(相对原样,供事件展示)
 	hash    string // 当前已加载内容 hash
-	pending string // 上轮观察到的候选 hash(两段确认)
+	pending string // 上轮观察到的候选 hash(两段确认:增/改)
+	misses  int    // 连续未见轮数(两段确认:删;瞬态目录读失败不误卸)
 	id      string // 在册插件 id(manifest)
 	plugin  *wasm.Plugin
 	loaded  bool
@@ -142,6 +146,27 @@ func (w *Watcher) Start(ctx context.Context) {
 // Stop 停止轮询(不卸载已注册插件;清退用 Watcher 外的宿主总闸)。
 func (w *Watcher) Stop() { w.stopOnce.Do(func() { close(w.stop) }) }
 
+// Unload 反注册并关闭全部已加载插件(mount 装配失败的全清路径:级联卸载带上
+// 依赖者,句柄逐个 Close,wasm 运行时不泄漏)。Stop 之后调用;幂等——已清空的
+// 观察表再调是空操作。正常关停不走这里(注册面归宿主总闸 Host.Close)。
+func (w *Watcher) Unload(ctx context.Context) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for p, u := range w.units {
+		if !u.loaded {
+			delete(w.units, p)
+			continue
+		}
+		if _, err := w.hf.Remove(u.id, true); err != nil {
+			w.logf("autoload: unload %s: %v", u.id, err)
+		}
+		if u.plugin != nil {
+			_ = u.plugin.Close(ctx)
+		}
+		delete(w.units, p)
+	}
+}
+
 // Poll 显式驱动一轮(装配层可与 Start 混用;并发调用互斥)。
 func (w *Watcher) Poll(ctx context.Context) []Event {
 	w.mu.Lock()
@@ -171,8 +196,7 @@ func (w *Watcher) pollOnceLocked(ctx context.Context) []Event {
 				}
 				return nil
 			}
-			lower := strings.ToLower(d.Name())
-			if !strings.HasSuffix(lower, wasm.SuffixWasm) && !strings.HasSuffix(lower, wasm.SuffixZip) {
+			if !wasm.IsPluginFile(d.Name(), w.opts.ExtraSuffixes) {
 				return nil
 			}
 			h, err := hashFS(fsys, path)
@@ -185,21 +209,28 @@ func (w *Watcher) pollOnceLocked(ctx context.Context) []Event {
 			return nil
 		})
 	}
-	// 1. 删除:本轮未见且已加载 → 立即卸载(宿主裁决 fail-closed)
+	// 1. 删除:两段确认(连续两轮未见才算真删,与增/改同哲学)——目录瞬态读失败、
+	// 文件系统抖动不误卸已加载插件;确认后卸载(宿主裁决 fail-closed)。
 	for p, u := range w.units {
 		if !u.loaded {
 			continue
 		}
 		if _, ok := seen[p]; ok {
+			u.misses = 0
 			continue
+		}
+		u.misses++
+		if u.misses < 2 {
+			continue // 首轮未见:待下一轮确认
 		}
 		ev := Event{Action: ActionRemove, PluginID: u.id, Path: p}
 		if _, err := w.hf.Remove(u.id, false); err != nil {
 			ev.Err = err // 被依赖:保留在册(插件继续服务),仅告警
+			u.misses = 0 // 依赖解除后需重新两段确认,不每轮重复告警
 		} else {
 			_ = u.plugin.Close(ctx)
+			delete(w.units, p)
 		}
-		delete(w.units, p)
 		events = append(events, ev)
 	}
 	// 2. 新增/变更:两段确认后装载
@@ -230,7 +261,7 @@ func (w *Watcher) applyChange(ctx context.Context, u *unit, h, p string, _ bool)
 		u.pending = ""
 		return Event{Action: ActionFailed, PluginID: u.id, Path: p, Err: err}
 	}
-	np, err := wasm.LoadFS(ctx, data, filepath.Base(p), wasm.Options{})
+	np, err := wasm.LoadFS(ctx, data, filepath.Base(p), wasm.Options{ExtraSuffixes: w.opts.ExtraSuffixes})
 	if err != nil {
 		if !u.loaded {
 			delete(w.units, p) // 从未入册的坏包:不留观察槽,待下次变化再试

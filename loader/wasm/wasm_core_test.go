@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ejfkdev/egop/contract"
 	"github.com/ejfkdev/egop/host"
@@ -413,4 +414,42 @@ func TestHostMetaAndConfigImports(t *testing.T) {
 	if v, _ := h.GetConfig("svc", "key"); string(v) != `"new"` {
 		t.Fatalf("svc.key after wasm set_config = %s", v)
 	}
+}
+
+// TestSelfPublishNoDeadlock 回归(P0 死锁):guest 在调用中发布命中自身订阅的事件,
+// 总线同步扇出在同一 goroutine 重入 pushEvent——阻塞取实例锁即对非重入锁自死锁。
+// 修复语义:pushEvent/invokeHook 经 TryLock,锁忙即跳过本次投递(best-effort),
+// 调用必须正常返回。夹具 testdata/selfpub.wat(订阅 {} 全命中 + egop_call 发布)。
+func TestSelfPublishNoDeadlock(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "selfpub.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadFS(context.Background(), b, "selfpub.egop.wasm", Options{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer p.Close(context.Background())
+	// 显式 MemEvents = 同步扇出,正是重入路径的触发条件。
+	bus := host.NewMemEvents()
+	h := host.New[any](host.Options[any]{Events: bus})
+	if err := h.Register(p); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	done := make(chan struct{})
+	var callErr error
+	go func() {
+		defer close(done)
+		_, callErr = h.Call(context.Background(), "wasm.selfpub", "boom", nil)
+	}()
+	select {
+	case <-done:
+		if callErr != nil {
+			t.Fatalf("call = %v", callErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: guest self-publish blocked forever on instance mutex")
+	}
+	// 跨 goroutine 投递仍然可达:插件空闲(锁可得)时 Dispatch 正常命中订阅。
+	bus.Dispatch(context.Background(), contract.Event{Type: "outside.topic", Payload: json.RawMessage(`{"n":1}`)})
 }

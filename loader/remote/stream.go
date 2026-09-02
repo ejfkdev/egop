@@ -122,6 +122,10 @@ type Frame struct {
 	Filter   *contract.EventFilter `json:"filter,omitempty"`   // subscribe 过滤条件
 	Config   json.RawMessage       `json:"config,omitempty"`   // apply_config
 	Reason   string                `json:"reason,omitempty"`   // shutdown
+	// Origin 是 call_func/hook 帧的调用来源(与 wasm ABI 的第三参同款语义:ctx 值
+	// 不跨边界,框架侧从 ctx 摘出上线,插件侧还原进处理 ctx)。旧对端不认识该字段
+	// 即自然忽略(加性演进,不破坏线上兼容)。
+	Origin *contract.Origin `json:"origin,omitempty"`
 }
 
 // marshal 把 Frame 编成一帧 JSON 字节。

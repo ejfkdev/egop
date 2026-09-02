@@ -236,8 +236,11 @@ rt, _, _ := mount.Mount(ctx, hf, mount.Sources{Dirs: []string{"./plugins"}, Watc
 for e := range rt.Events() { /* register / replace / remove / failed */ }
 ```
 
-语义：内容 hash 两段确认（抗半截写）、替换失败回退保旧版、替换成功重放配置、
-坏包隔离、删除被依赖者 fail-closed；`mount` 首装"拍至稳定"补全乱序依赖链。
+语义：内容 hash 两段确认（抗半截写）、**删除同样两段确认**（连续两轮未见才卸载，
+抗目录瞬态读失败误卸）、替换失败回退保旧版（`Replace` 与 `Register` 同款契约校验，
+拒换即旧版继续服务）、替换成功重放配置、坏包隔离、删除被依赖者 fail-closed
+（点名与槽位依赖同判）；`mount` 首装"拍至稳定"补全乱序依赖链，装配失败时句柄
+自行**全清**（含反注册目录阶段已进册的插件）。
 
 ## 10. ctx 能力面（Surface）对照
 
@@ -253,13 +256,16 @@ for e := range rt.Events() { /* register / replace / remove / failed */ }
 | `storage.kv` | `KV` | 返回 `(nil,false)` |
 | `exec.cmd` | `Exec` | 报错 |
 | `net.access` | `Net`（Request / DialStream，协议门：拒绝 `file://` 等非网络 scheme） | 返回 `(nil,false)` |
+| `fs.read` | `FS().ReadFile`（全局文件系统受控视图，范围/沙箱由注入实现决定） | `FS()` 返回 `(nil,false)`；只声明 write 时 ReadFile 报错 |
+| `fs.write` | `FS().WriteFile` | 同上（分向门控） |
 | 扩展能力（装配注入） | `Op(ctx,name,input)` | 经 `OpAliases` 映射守卫词后判定 |
 
 `Host.SurfaceFor(pluginID)` 可导出同一门控视图（远程插件的能力回程 `HostCall`
 一律经它路由，与进程内插件同语义）。`Persist`/`KV` 的后端经 `Options.Storage` **必填注入**、
 `Exec` 经 `Options.ExecFn` 注入、出站网络（HTTP/HTTPS/SSE/WebSocket/WebTransport 等）经
-`Options.Net` 注入——egop 自身不实现任何文件/网络/命令执行传输。出站目标须是网络协议
-（内置 `http`/`https`/`ws`/`wss`，`Options.NetSchemes` 可补充）`file://` 等本地访问被协议门拒绝。
+`Options.Net` 注入、全局文件系统经 `Options.FS` 注入——egop 自身不实现任何文件/网络/
+命令执行传输。出站目标须是网络协议（内置 `http`/`https`/`ws`/`wss`，`Options.NetSchemes`
+可补充），`file://` 等本地访问被协议门拒绝。
 
 ## 11. Hook 派发与 effect 自动回滚
 

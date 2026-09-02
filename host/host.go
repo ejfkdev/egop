@@ -42,6 +42,9 @@ type Options[C any] struct {
 	// Storage 持久化注入后端(必填;nil → Persist/KV 不可用)。
 	Storage contract.Storage
 	Net     contract.Net // 出站网络注入后端(必填;nil → Net 不可用)
+	// FS 全局文件系统注入后端(nil → Surface.FS 不可用)。可见范围/沙箱策略由
+	// 实现决定;能力门控(fs.read/fs.write 分向)由宿主 fsGuard 单点强制。
+	FS contract.FS
 	// NetSchemes 补充允许的**网络协议 scheme**(小写,如 "webtransport"、自定义)。
 	// 内置 http/https/ws/wss 始终允许;file:// 等本地/特殊 scheme 一律拒绝。
 	NetSchemes []string
@@ -84,6 +87,11 @@ type Host[C any] struct {
 	seq     map[string]uint64 // 注册序(Close 逆序清退用)
 	nextSeq uint64
 	effects map[string]*undo.Catcher // 每个插件注册的 effect 撤销栈(Remove/Replace 自动回滚)
+
+	// cfgMu 串行化配置写链路(SetConfig/SetConfigField 的读改写全程):并发下发
+	// 不交错、单字段合并不丢更新。配置写是控制面低频操作,串行代价可忽略;
+	// 与 mu 分离,ApplyConfig(插件代码)执行期间不占用宿主目录锁。
+	cfgMu sync.Mutex
 
 	pending        []string                   // 懒加载待补载 id(保持插入序)
 	pendingPlugins map[string]contract.Plugin // id → 待补载插件
@@ -331,6 +339,39 @@ func (h *Host[C]) removePendingLocked(id string) {
 	}
 }
 
+// validateContractLocked 校验插件的契约前提:DepInit 依赖已就位(点名/槽位/版本)
+// + 槽位八轴最小契约满足。Register 与 Replace 共用——热替换不得比首次注册宽松,
+// 否则坏包可绕过契约从替换口进入。需持 h.mu。
+func (h *Host[C]) validateContractLocked(m contract.Meta) error {
+	for _, r := range m.Requires.Deps {
+		if r.Kind != contract.DepInit {
+			continue
+		}
+		if r.Slot != "" {
+			if !h.slotSatisfiedLocked(r.Slot) {
+				return fmt.Errorf("host: plugin %s: init-dependency slot %q not satisfied", m.ID, r.Slot)
+			}
+			continue
+		}
+		if _, ok := h.plugins[r.Plugin]; !ok {
+			return fmt.Errorf("host: plugin %s: init-dependency %q not registered", m.ID, r.Plugin)
+		}
+		if r.MinVersion != "" && !versionAtLeast(h.meta[r.Plugin].Version, r.MinVersion) {
+			return fmt.Errorf("host: plugin %s: init-dependency %q version %q < required %q", m.ID, r.Plugin, h.meta[r.Plugin].Version, r.MinVersion)
+		}
+	}
+	if m.Slot != "" {
+		_, ok, miss := h.slotCheck(m)
+		if !ok {
+			return fmt.Errorf("host: plugin %s: unknown slot %q", m.ID, m.Slot)
+		}
+		if len(miss) > 0 {
+			return fmt.Errorf("host: plugin %s: slot %q minimal contract unmet: %s", m.ID, m.Slot, strings.Join(miss, "; "))
+		}
+	}
+	return nil
+}
+
 // registerLocked 在持锁下完成全部校验与簿记,返回 SurfaceAware 供锁外注入 Surface。
 func (h *Host[C]) registerLocked(p contract.Plugin, m contract.Meta) (contract.SurfaceAware, error) {
 	h.mu.Lock()
@@ -340,32 +381,9 @@ func (h *Host[C]) registerLocked(p contract.Plugin, m contract.Meta) (contract.S
 	}
 	// 该 id 若之前在待补载队列,进册/替换时同步移出,避免"pending + 已注册"双份。
 	h.removePendingLocked(m.ID)
-	for _, r := range m.Requires.Deps {
-		if r.Kind != contract.DepInit {
-			continue
-		}
-		if r.Slot != "" {
-			if !h.slotSatisfiedLocked(r.Slot) {
-				return nil, fmt.Errorf("host: plugin %s: init-dependency slot %q not satisfied", m.ID, r.Slot)
-			}
-			continue
-		}
-		if _, ok := h.plugins[r.Plugin]; !ok {
-			return nil, fmt.Errorf("host: plugin %s: init-dependency %q not registered", m.ID, r.Plugin)
-		}
-		if r.MinVersion != "" && !versionAtLeast(h.meta[r.Plugin].Version, r.MinVersion) {
-			return nil, fmt.Errorf("host: plugin %s: init-dependency %q version %q < required %q", m.ID, r.Plugin, h.meta[r.Plugin].Version, r.MinVersion)
-		}
-	}
-	if m.Slot != "" {
-		spec, ok, miss := h.slotCheck(m)
-		if !ok {
-			return nil, fmt.Errorf("host: plugin %s: unknown slot %q", m.ID, m.Slot)
-		}
-		if len(miss) > 0 {
-			return nil, fmt.Errorf("host: plugin %s: slot %q minimal contract unmet: %s", m.ID, m.Slot, strings.Join(miss, "; "))
-		}
-		_ = spec
+	// 替换语义下依赖校验以"自身已在册"为真:此处首注册,自身必不在册,无须排除。
+	if err := h.validateContractLocked(m); err != nil {
+		return nil, err
 	}
 	if fp, ok := p.(contract.FunctionProvider); ok {
 		for _, f := range m.Provides.Functions {
@@ -519,6 +537,45 @@ func (h *Host[C]) slotCheck(m contract.Meta) (contract.SlotSpec, bool, []string)
 	return spec, true, miss
 }
 
+// slotSatisfiedExcludingLocked 判定槽位在**排除某在册插件**后是否仍被满足
+// (内置槽位,或该插件之外的任一在册主张者)。Remove 用它精确判定:被删插件
+// 占据的槽位若仍有其它供给,槽位依赖方不算被破坏。需持 h.mu。
+func (h *Host[C]) slotSatisfiedExcludingLocked(slot, excludeID string) bool {
+	if h.opts.SlotLookup != nil {
+		if s, ok := h.opts.SlotLookup(slot); ok && s.Builtin {
+			return true
+		}
+	}
+	for id, m := range h.meta {
+		if id != excludeID && m.Slot == slot {
+			return true
+		}
+	}
+	return false
+}
+
+// depBrokenByRemovalLocked 判定在册插件 m 的 DepInit 依赖是否会因删除
+// (removeID, 其占据槽位 removeSlot)而断:点名依赖直接断;点槽位依赖仅当该槽位
+// 失去 removeID 后无任何其它供给(内置/其它主张者)才算断。需持 h.mu。
+func (h *Host[C]) depBrokenByRemovalLocked(m contract.Meta, removeID, removeSlot string) bool {
+	for _, r := range m.Requires.Deps {
+		if r.Kind != contract.DepInit {
+			continue
+		}
+		switch {
+		case r.Plugin != "":
+			if r.Plugin == removeID {
+				return true
+			}
+		case r.Slot != "" && r.Slot == removeSlot:
+			if !h.slotSatisfiedExcludingLocked(r.Slot, removeID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Remove 级联卸载（cascade=false 且被依赖时 fail-closed）。
 // 只清宿主目录与 effect 栈;不调用 Disposer——若插件持有原生资源,调用方须自行
 // Close 其句柄(autoload 卸载/热替换正是如此)。
@@ -528,14 +585,15 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 		h.mu.Unlock()
 		return nil, nil
 	}
-	victims := []string{pluginID}
+	targetSlot := h.meta[pluginID].Slot
 	if !cascade {
 		var deps []string
 		for id, m := range h.meta {
-			for _, r := range m.Requires.Deps {
-				if r.Kind == contract.DepInit && (r.Plugin == pluginID || r.Slot == pluginID) {
-					deps = append(deps, id)
-				}
+			if id == pluginID {
+				continue
+			}
+			if h.depBrokenByRemovalLocked(m, pluginID, targetSlot) {
+				deps = append(deps, id)
 			}
 		}
 		if len(deps) > 0 {
@@ -543,8 +601,12 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 			return nil, fmt.Errorf("host: remove %q refused: still required by %v (use cascade)", pluginID, deps)
 		}
 	}
-	// 逐 victim 在删除前记录版本(供 removed 事件载荷)。
+	// 逐 victim 在删除前记录版本(供 removed 事件载荷);inVictim 去重(一个依赖者
+	// 可能有多条边指向被删集合,只计一次,removed 事件也只广播一次)。删除边删边判:
+	// 槽位若仍有其它在册供给,槽位依赖方不进 victims。
 	versions := map[string]string{}
+	inVictim := map[string]bool{pluginID: true}
+	victims := []string{pluginID}
 	queue := victims
 	for len(queue) > 0 {
 		id := queue[0]
@@ -552,6 +614,7 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 		if m, ok := h.meta[id]; ok {
 			versions[id] = m.Version
 		}
+		idSlot := h.meta[id].Slot
 		delete(h.plugins, id)
 		delete(h.meta, id)
 		delete(h.seq, id)
@@ -566,11 +629,13 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 			delete(h.effects, id)
 		}
 		for id2, m := range h.meta {
-			for _, r := range m.Requires.Deps {
-				if r.Kind == contract.DepInit && (r.Plugin == id || r.Slot == id) {
-					victims = append(victims, id2)
-					queue = append(queue, id2)
-				}
+			if inVictim[id2] {
+				continue
+			}
+			if h.depBrokenByRemovalLocked(m, id, idSlot) {
+				inVictim[id2] = true
+				victims = append(victims, id2)
+				queue = append(queue, id2)
 			}
 		}
 	}
@@ -584,16 +649,22 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 	return victims, nil
 }
 
-// Replace 热替换同 id 插件。
+// Replace 热替换同 id 插件。契约校验与 Register 同款(DepInit 依赖/槽位八轴)——
+// 替换口不得比注册口宽松,坏包 fail-closed 拒换、旧版继续服务。
 // 只置换目录并清退旧实现的 effect 栈;旧实现若是 Disposer,调用方须自行 Close
 // 旧句柄(autoload 热替换正是如此:Replace 后立即 old.Close)。
 func (h *Host[C]) Replace(p contract.Plugin) error {
-	id := p.Meta().ID
+	m := p.Meta()
+	id := m.ID
 	var surfaceAware contract.SurfaceAware
 	h.mu.Lock()
 	if _, ok := h.plugins[id]; !ok {
 		h.mu.Unlock()
 		return fmt.Errorf("host: replace: %q not registered", id)
+	}
+	if err := h.validateContractLocked(m); err != nil {
+		h.mu.Unlock()
+		return fmt.Errorf("host: replace: %w", err)
 	}
 	for k := range h.fns {
 		if h.fns[k].pluginID == id {
@@ -601,9 +672,24 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 		}
 	}
 	h.plugins[id] = p
-	h.meta[id] = p.Meta()
+	h.meta[id] = m
+	// 替换件的新声明面(点位/主题)与首注册一致地补落。
+	for _, hp := range m.Provides.Hooks {
+		h.ensurePoint(contract.PointID(id, hp.ID))
+	}
+	for _, pt := range m.Provides.Points {
+		h.ensurePoint(pt)
+	}
+	for _, pt := range m.Requires.Listens {
+		h.ensurePoint(pt)
+	}
+	for _, ev := range m.Provides.Events {
+		if h.opts.Events != nil {
+			h.opts.Events.EnsureTopic(contract.EventID(id, ev.ID))
+		}
+	}
 	if fp, ok := p.(contract.FunctionProvider); ok {
-		for _, f := range p.Meta().Provides.Functions {
+		for _, f := range m.Provides.Functions {
 			h.fns[id+"."+f.Name] = fnEntry{pluginID: id, spec: f, provider: fp}
 		}
 	}
@@ -620,10 +706,10 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 	}
 	// 同 Register:SetSurface 在锁外,插件可在其中回查宿主而不死锁。
 	if surfaceAware != nil {
-		h.injectSurface(surfaceAware, id, h.surfaceFor(p.Meta(), newEff))
+		h.injectSurface(surfaceAware, id, h.surfaceFor(m, newEff))
 	}
-	h.logf("host: plugin %s replaced (v%s)", id, p.Meta().Version)
-	h.emitLifecycle(contract.EventPluginReplaced, id, p.Meta().Version)
+	h.logf("host: plugin %s replaced (v%s)", id, m.Version)
+	h.emitLifecycle(contract.EventPluginReplaced, id, m.Version)
 	h.retryPending()
 	return nil
 }
@@ -661,10 +747,16 @@ func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.R
 	return out, err
 }
 
-// SetConfig 下发配置（配置 Schema 校验 + Configurable）。
 // SetConfig 下发配置（配置 Schema 校验 + Configurable）。插件 ApplyConfig panic
-// 归一到 error(机制层 fail-closed)。
+// 归一到 error(机制层 fail-closed)。配置写链路全程经 cfgMu 串行(并发下发不交错)。
 func (h *Host[C]) SetConfig(pluginID string, cfg json.RawMessage) (err error) {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+	return h.setConfig(pluginID, cfg)
+}
+
+// setConfig 是 SetConfig 的本体(要求已持 cfgMu;SetConfigField 合并后复用)。
+func (h *Host[C]) setConfig(pluginID string, cfg json.RawMessage) (err error) {
 	defer fromPanic(&err, fmt.Sprintf("plugin %s apply config", pluginID))
 	h.mu.Lock()
 	p, ok := h.plugins[pluginID]
@@ -803,17 +895,22 @@ func (h *Host[C]) HasPlugin(id string) bool {
 }
 
 // Dependents 返回以 DepInit(点名或槽位)依赖该插件的在册插件 id 列表
-// (元数据反查:卸载前判断 fail-closed、控制面展示链路)。
+// (元数据反查:卸载前判断 fail-closed、控制面展示链路)。槽位依赖按"删除该插件
+// 后槽位是否仍有其它供给"精确判定——与 Remove 的 fail-closed 判定同一语义。
 func (h *Host[C]) Dependents(pluginID string) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if _, ok := h.plugins[pluginID]; !ok {
+		return nil
+	}
+	slot := h.meta[pluginID].Slot
 	var out []string
 	for id, m := range h.meta {
-		for _, r := range m.Requires.Deps {
-			if r.Kind == contract.DepInit && (r.Plugin == pluginID || r.Slot == pluginID) {
-				out = append(out, id)
-				break
-			}
+		if id == pluginID {
+			continue
+		}
+		if h.depBrokenByRemovalLocked(m, pluginID, slot) {
+			out = append(out, id)
 		}
 	}
 	return out
@@ -883,9 +980,12 @@ func (h *Host[C]) EffectiveConfig(pluginID string) (json.RawMessage, bool) {
 
 // SetConfigField 合并单字段进整份生效配置(读旧 applied→补 key→整对象下发)。egop 层
 // 无能力门控(UI/装配层单字段保存用);与 SetConfig(整对象替换)区别开。
+// 读改写在 cfgMu 内一次完成:并发写不同字段互不丢更新。
 func (h *Host[C]) SetConfigField(pluginID, key string, value json.RawMessage) error {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
 	h.mu.Lock()
-	raw, _ := h.applied[pluginID]
+	raw := h.applied[pluginID]
 	h.mu.Unlock()
 	obj := map[string]json.RawMessage{}
 	if len(raw) > 0 {
@@ -896,7 +996,7 @@ func (h *Host[C]) SetConfigField(pluginID, key string, value json.RawMessage) er
 	if err != nil {
 		return err
 	}
-	return h.SetConfig(pluginID, full)
+	return h.setConfig(pluginID, full)
 }
 
 // GetConfig 读某插件生效配置里的单个字段(egop 层读;无能力门控。跨插件读经
@@ -1020,6 +1120,10 @@ func (h *Host[C]) OnHook(hookID string, fn contract.HookFunc) func() {
 func (h *Host[C]) TriggerHook(ctx context.Context, hookID string, data json.RawMessage) []contract.HookResult {
 	if h.opts.Hooks == nil {
 		return nil
+	}
+	// 无调用来源时注入框架来源(与 Call 一致):hook 回调经 OriginFrom 知道"哪个点触发"。
+	if contract.OriginFrom(ctx) == nil {
+		ctx = contract.WithOrigin(ctx, &contract.Origin{Kind: contract.OriginHost, Point: hookID, At: time.Now().UnixMilli()})
 	}
 	return h.opts.Hooks.Trigger(ctx, hookID, data)
 }
@@ -1164,6 +1268,14 @@ func (e *plugSurface[C]) Net() (contract.Net, bool) {
 	}
 	// 单点强制:权限门控(上面) + 协议门(下面)——目标必须是网络协议,拒绝 file:// 等。
 	return netGuard{next: e.h.opts.Net, schemes: e.h.netSchemes}, true
+}
+func (e *plugSurface[C]) FS() (contract.FS, bool) {
+	canRead, canWrite := e.caps[contract.CapFSRead], e.caps[contract.CapFSWrite]
+	if (!canRead && !canWrite) || e.h.opts.FS == nil {
+		return nil, false
+	}
+	// 单点强制:读写按声明分向门控(fsGuard);范围/沙箱策略在注入的实现里。
+	return fsGuard{next: e.h.opts.FS, pluginID: e.meta.ID, canRead: canRead, canWrite: canWrite}, true
 }
 func (e *plugSurface[C]) Exec(ctx context.Context, cmd string) (string, error) {
 	if !e.caps[contract.CapExec] || e.h.opts.ExecFn == nil {

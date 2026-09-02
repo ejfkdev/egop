@@ -164,9 +164,11 @@ func (s *Session) Register(ctx context.Context, manifest json.RawMessage, token 
 	return rep, nil
 }
 
-// CallFunc 框架→插件:调用插件函数(回复 payload 为信封)。
+// CallFunc 框架→插件:调用插件函数(回复 payload 为信封)。ctx 里的调用来源
+// (contract.OriginFrom)摘出随帧上线,插件侧还原进处理 ctx——与 wasm ABI 的
+// egop_call 第三参同款语义(ctx 值不跨边界)。
 func (s *Session) CallFunc(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
-	return s.requestPayload(ctx, &Frame{Kind: KindCallFunc, Fname: fname, Input: input})
+	return s.requestPayload(ctx, &Frame{Kind: KindCallFunc, Fname: fname, Input: input, Origin: contract.OriginFrom(ctx)})
 }
 
 // Tool 框架→插件:工具调用。
@@ -175,8 +177,9 @@ func (s *Session) Tool(ctx context.Context, tool string, args, tctx json.RawMess
 }
 
 // Hook 框架→插件:hook 回调触发(回复 payload 为 HookResult JSON 信封)。
+// 触发来源随帧上线(同 CallFunc)。
 func (s *Session) Hook(ctx context.Context, hookID string, data json.RawMessage) (json.RawMessage, error) {
-	return s.requestPayload(ctx, &Frame{Kind: KindHook, HookID: hookID, Input: data})
+	return s.requestPayload(ctx, &Frame{Kind: KindHook, HookID: hookID, Input: data, Origin: contract.OriginFrom(ctx)})
 }
 
 // ApplyConfig 框架→插件:配置下发。
@@ -368,11 +371,21 @@ func peerCallErr(fn func() error) (err error) {
 	return fn()
 }
 
+// withFrameOrigin 把帧上线的调用来源还原进处理 ctx(插件侧经 OriginFrom 读回
+// "谁调了我/哪个点触发";无来源帧原样返回)。
+func withFrameOrigin(ctx context.Context, f *Frame) context.Context {
+	if f.Origin == nil {
+		return ctx
+	}
+	return contract.WithOrigin(ctx, f.Origin)
+}
+
 func (s *Session) dispatchCall(ctx context.Context, peer Peer, f *Frame) {
 	if peer == nil {
 		s.replyErr(f.Id, "remote: call before handshake")
 		return
 	}
+	ctx = withFrameOrigin(ctx, f)
 	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleCall(ctx, f.Fname, f.Input) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())
@@ -399,6 +412,7 @@ func (s *Session) dispatchHook(ctx context.Context, peer Peer, f *Frame) {
 		s.replyErr(f.Id, "remote: hook before handshake")
 		return
 	}
+	ctx = withFrameOrigin(ctx, f)
 	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHook(ctx, f.HookID, f.Input) })
 	if err != nil {
 		s.replyErr(f.Id, err.Error())

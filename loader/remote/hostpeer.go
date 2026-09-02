@@ -4,11 +4,14 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strconv"
 	"sync"
 
 	"github.com/ejfkdev/egop/contract"
@@ -28,10 +31,41 @@ type hostPeer struct {
 	pushFn   func(e contract.Event) // 订阅事件推帧口(会话构造后回填)
 	hookFn   func(ctx context.Context, hookID string, data json.RawMessage) (json.RawMessage, error)
 	unsubs   undo.Catcher
+
+	netSeq    int64                // 出站流式 body 句柄序号(mu 下自增)
+	netBodies map[string]io.Reader // 句柄 → 未读完的响应 body(net_body_read/close 消费;断连清理)
 }
 
 func newHostPeer(rh RemoteHost, pluginID string) *hostPeer {
-	return &hostPeer{host: rh, pluginID: pluginID}
+	return &hostPeer{host: rh, pluginID: pluginID, netBodies: map[string]io.Reader{}}
+}
+
+// netAlloc 登记一条流式响应 body,返回字符串句柄(调用方持 hp.mu)。
+func (hp *hostPeer) netAlloc(r io.Reader) string {
+	hp.netSeq++
+	key := strconv.FormatInt(hp.netSeq, 10)
+	hp.netBodies[key] = r
+	return key
+}
+
+// netGet 取句柄对应的 body 读端(调用方持 hp.mu);未知/已关返回 nil。
+func (hp *hostPeer) netGet(handle string) io.Reader { return hp.netBodies[handle] }
+
+// netClose 关闭并遗忘一条 body 句柄(调用方持 hp.mu;幂等)。
+func (hp *hostPeer) netClose(handle string) {
+	if b, ok := hp.netBodies[handle]; ok {
+		if c, ok := b.(io.Closer); ok {
+			_ = c.Close()
+		}
+		delete(hp.netBodies, handle)
+	}
+}
+
+// netCloseAll 断连清理:关闭全部未读完的 body(调用方持 hp.mu)。
+func (hp *hostPeer) netCloseAll() {
+	for h := range hp.netBodies {
+		hp.netClose(h)
+	}
 }
 
 // SetPush 回填事件推帧口(会话与 peer 互相引用的接缝)。
@@ -253,6 +287,99 @@ func (hp *hostPeer) HandleHostCall(ctx context.Context, op string, input json.Ra
 			return nil, err
 		}
 		return json.RawMessage("null"), nil
+	case OpFSRead:
+		var a readArgs
+		if err := json.Unmarshal(input, &a); err != nil {
+			return nil, fmt.Errorf("bad %s args: %w", op, err)
+		}
+		fsys, ok := sur.FS()
+		if !ok {
+			return nil, notAvailable(contract.CapFSRead)
+		}
+		data, err := fsys.ReadFile(a.Name)
+		if err != nil {
+			return nil, err
+		}
+		return mustJSON(map[string]any{"data_b64": base64.StdEncoding.EncodeToString(data)}), nil
+	case OpFSWrite:
+		var a writeArgs
+		if err := json.Unmarshal(input, &a); err != nil {
+			return nil, fmt.Errorf("bad %s args: %w", op, err)
+		}
+		fsys, ok := sur.FS()
+		if !ok {
+			return nil, notAvailable(contract.CapFSWrite)
+		}
+		data, err := b64bytes(a.DataB64)
+		if err != nil {
+			return nil, fmt.Errorf("bad %s data_b64: %w", op, err)
+		}
+		return json.RawMessage("null"), fsys.WriteFile(a.Name, data)
+	case OpNetRequest:
+		net, ok := sur.Net()
+		if !ok {
+			return nil, notAvailable(contract.CapNet)
+		}
+		var a struct {
+			Method  string            `json:"method"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+			BodyB64 string            `json:"body_b64"` // base64 请求体(整包;流式请求体不跨边界)
+		}
+		if err := json.Unmarshal(input, &a); err != nil {
+			return nil, fmt.Errorf("bad %s args: %w", op, err)
+		}
+		var body io.Reader
+		if a.BodyB64 != "" {
+			b, err := b64bytes(a.BodyB64)
+			if err != nil {
+				return nil, fmt.Errorf("bad %s body_b64: %w", op, err)
+			}
+			body = bytes.NewReader(b)
+		}
+		resp, err := net.Request(ctx, contract.Request{Method: a.Method, URL: a.URL, Headers: a.Headers, Body: body})
+		if err != nil {
+			return nil, err
+		}
+		hp.mu.Lock()
+		handle := hp.netAlloc(resp.Body)
+		hp.mu.Unlock()
+		return mustJSON(map[string]any{
+			"status":      resp.Status,
+			"headers":     resp.Headers,
+			"trailers":    resp.Trailers,
+			"body_handle": handle,
+		}), nil
+	case OpNetBodyRead:
+		var a handleArgs
+		if err := json.Unmarshal(input, &a); err != nil {
+			return nil, fmt.Errorf("bad %s args: %w", op, err)
+		}
+		hp.mu.Lock()
+		body := hp.netGet(a.Handle)
+		hp.mu.Unlock()
+		if body == nil {
+			// 未知/已关句柄:返回 eof,让插件侧 Read 得到 io.EOF 收尾。
+			return mustJSON(map[string]any{"eof": true}), nil
+		}
+		buf := make([]byte, netChunkSize)
+		n, err := body.Read(buf)
+		if n > 0 {
+			return mustJSON(map[string]any{"chunk_b64": base64.StdEncoding.EncodeToString(buf[:n])}), nil
+		}
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		return mustJSON(map[string]any{"eof": true}), nil
+	case OpNetBodyClose:
+		var a handleArgs
+		if err := json.Unmarshal(input, &a); err != nil {
+			return nil, fmt.Errorf("bad %s args: %w", op, err)
+		}
+		hp.mu.Lock()
+		hp.netClose(a.Handle)
+		hp.mu.Unlock()
+		return json.RawMessage("null"), nil
 	default:
 		// 其余 op 一律经 Surface.Op 扩展:守卫词与处理器由装配层注入(Options.OpAliases/Ops)。
 		return sur.Op(ctx, op, input)
@@ -276,9 +403,13 @@ func (hp *hostPeer) HandleSubscribe(_ context.Context, f *contract.EventFilter) 
 	hp.unsubs.Defer(unsub)
 }
 
-// UnsubAll 断连清理订阅(统一 effect 栈,反序清退)。
+// UnsubAll 断连清理:撤销订阅(统一 effect 栈,反序清退)+ 关闭全部未读完的
+// 出站响应 body(句柄泄漏兜底:对端消失后不再有人 read/close)。
 func (hp *hostPeer) UnsubAll() {
 	_ = hp.unsubs.Close()
+	hp.mu.Lock()
+	hp.netCloseAll()
+	hp.mu.Unlock()
 }
 
 func notAvailable(cap string) error {

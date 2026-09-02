@@ -100,7 +100,12 @@ func TestPollRegisterAndRemove(t *testing.T) {
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
-	evs = settle(t, w, 2)
+	// 删除也是两段确认:首轮未见只记候选,不卸载(抗目录瞬态读失败/文件系统抖动)。
+	evs = w.Poll(context.Background())
+	if hasAction(t, evs, ActionRemove) || !h.HasPlugin("wasm.demo") {
+		t.Fatalf("removal must wait for a second confirming round: events=%v", evs)
+	}
+	evs = w.Poll(context.Background())
 	if !hasAction(t, evs, ActionRemove) || h.HasPlugin("wasm.demo") {
 		t.Fatalf("remove events=%v still=%v", evs, h.HasPlugin("wasm.demo"))
 	}

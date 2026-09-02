@@ -34,6 +34,9 @@ type Sources struct {
 	// FS 注入的只读文件系统:非 nil 时 Dirs 视作该 FS 内的根目录(内嵌/浏览器用,
 	// 例如 fstest.MapFS 或自定义实现);nil = 操作系统目录。
 	FS fs.FS `json:"-"`
+	// ExtraSuffixes 追加的插件 zip 包后缀(透传 wasm.Options.ExtraSuffixes;
+	// 品牌/项目自有后缀由装配注入,内容无关库不内置业务词)。
+	ExtraSuffixes []string `json:"extra_suffixes,omitempty"`
 	// Watch 监视 Dirs 热更(增/改/删 → 注册/热替换/卸载);Interval 轮询周期(0=1s)。
 	Watch    bool          `json:"watch,omitempty"`
 	Interval time.Duration `json:"-"`
@@ -55,21 +58,27 @@ type Runtime struct {
 	mu       sync.Mutex
 	sessions []*remote.Session
 	inbound  []remote.Stream // 入站已接受的流(Runtime 责任在 Close 时关闭)
+	failed   bool            // 装配失败标记:Close 走全清(含目录插件反注册)
 	watcher  *autoload.Watcher
 	cancel   context.CancelFunc // 停止注入的入站 accept 循环
 }
 
 // Mount 按来源装配:目录三连拍两段确认装载、出站拨号、入站 accept;Watch 时
-// 开热更轮询。返回 (运行句柄, 目录坏包告警, 装配错误——错误时句柄已自行全清)。
+// 开热更轮询。返回 (运行句柄, 目录坏包告警, 装配错误——错误时句柄已自行全清:
+// 停 watcher/会话/入站流,并反注册+关闭目录阶段已进册的插件,宿主回到装配前
+// 状态,wasm 运行时句柄不泄漏)。
 func Mount(ctx context.Context, hf loader.HostFace, src Sources) (*Runtime, []error, error) {
 	rt := &Runtime{hf: hf, src: src}
 	fail := func(err error) (*Runtime, []error, error) {
+		rt.mu.Lock()
+		rt.failed = true
+		rt.mu.Unlock()
 		rt.Close()
 		return nil, nil, err
 	}
 
 	var warns []error
-	w := autoload.New(hf, src.Dirs, autoload.Options{Interval: src.Interval, Logf: src.Logf, FS: src.FS})
+	w := autoload.New(hf, src.Dirs, autoload.Options{Interval: src.Interval, Logf: src.Logf, FS: src.FS, ExtraSuffixes: src.ExtraSuffixes})
 	// 首批装载:两段确认语义下先三连拍落定,再继续拍到无新注册/替换为止——
 	// 依赖链乱序时后落地件会跨轮补载,固定三拍会漏掉;apply 顺序本身受 map 遍历
 	// 随机性影响,须以"无进展即停"判定,而非固定次数。
@@ -190,11 +199,17 @@ func (rt *Runtime) Events() <-chan autoload.Event {
 
 // Close 统一清退:停热更、停入站 accept(并关闭已接受的入站流,传导对端 EOF)、
 // 断出站会话(OnClosed 触发宿主卸载)。幂等。
+// 装配失败路径(failed)额外做全清:目录阶段已进册的插件反注册并关闭句柄
+// (级联带上其依赖者),宿主回到装配前状态,wasm 运行时不泄漏;正常关停不做
+// 此步——注册面归宿主,由宿主总闸(Host.Close)统一清退。
 func (rt *Runtime) Close() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if rt.watcher != nil {
 		rt.watcher.Stop()
+		if rt.failed {
+			rt.watcher.Unload(context.Background())
+		}
 	}
 	if rt.cancel != nil {
 		rt.cancel()

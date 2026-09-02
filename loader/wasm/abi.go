@@ -11,10 +11,13 @@
 package wasm
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/ejfkdev/egop/contract"
 	"github.com/tetratelabs/wazero"
@@ -87,13 +90,26 @@ const (
 	ImportOnHook = "on_hook"
 	// ImportReadAsset 读 .egop.zip 内 assets/ 静态资源。
 	ImportReadAsset = "read_asset"
+	// ImportFSRead Surface.FS:读全局文件系统(需 fs.read;结果走 result_b64)。
+	ImportFSRead = "fs_read"
+	// ImportFSWrite Surface.FS:写全局文件系统(需 fs.write;入参 (name,data) 字符串对)。
+	ImportFSWrite = "fs_write"
 	// ImportLog 日志直出:经 Options.LogFn 接入宿主日志面(nil = 静默)。
 	ImportLog = "log"
+	// ImportNetRequest Surface.Net:发起一次 HTTP(S) 请求(入参=编组请求 JSON;
+	// result=状态/头/流式 body 句柄)。响应 body 经 ImportNetBodyRead 增量读。
+	ImportNetRequest = "net_request"
+	// ImportNetBodyRead Surface.Net:读流式响应 body 的一段字节(chunk 走 result_b64 信封)。
+	ImportNetBodyRead = "net_body_read"
+	// ImportNetBodyClose Surface.Net:关闭并释放 body 句柄。
+	ImportNetBodyClose = "net_body_close"
 
 	// ManifestSection 是 .egop.wasm 内置清单的自定义段名。
 	ManifestSection = "egop.manifest"
 
 	// SuffixWasm / SuffixZip 是插件文件命名后缀约定(*.egop.wasm / *.egop.zip)。
+	// 消费方的其它后缀约定(自有品牌 zip 等)经 Options.ExtraSuffixes 装配注入——
+	// 品牌词不进内容无关库。
 	SuffixWasm = ".egop.wasm"
 	SuffixZip  = ".egop.zip"
 )
@@ -375,10 +391,96 @@ var hostOps = []hostOp{
 		}
 		return b64Res(data)
 	}},
+	{name: ImportFSRead, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surface == nil {
+			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
+		}
+		fsys, ok := p.surface.FS()
+		if !ok {
+			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapFSRead))
+		}
+		data, err := fsys.ReadFile(args[0])
+		if err != nil {
+			return errRes(err)
+		}
+		return b64Res(data)
+	}},
+	{name: ImportFSWrite, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surface == nil {
+			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
+		}
+		fsys, ok := p.surface.FS()
+		if !ok {
+			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapFSWrite))
+		}
+		if err := fsys.WriteFile(args[0], []byte(args[1])); err != nil {
+			return errRes(err)
+		}
+		return okRes(nil)
+	}},
 	{name: ImportLog, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
 		if p.logFn != nil {
 			p.logFn(args[0], args[1]) // args = (level, msg)
 		}
+		return okRes(nil)
+	}},
+	{name: ImportNetRequest, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surface == nil {
+			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
+		}
+		net, ok := p.surface.Net()
+		if !ok {
+			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapNet))
+		}
+		var req struct {
+			Method  string            `json:"method"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+			Body    string            `json:"body_b64"` // base64 请求体(整包;流式请求体不跨边界)
+		}
+		if err := json.Unmarshal([]byte(args[0]), &req); err != nil {
+			return errRes(fmt.Errorf("bad net request: %w", err))
+		}
+		var body io.Reader
+		if req.Body != "" {
+			b, err := base64.StdEncoding.DecodeString(req.Body)
+			if err != nil {
+				return errRes(fmt.Errorf("bad net request body: %w", err))
+			}
+			body = bytes.NewReader(b)
+		}
+		resp, err := net.Request(ctx, contract.Request{Method: req.Method, URL: req.URL, Headers: req.Headers, Body: body})
+		if err != nil {
+			return errRes(err)
+		}
+		return okRes(mustJSON(map[string]any{
+			"status":      resp.Status,
+			"headers":     resp.Headers,
+			"trailers":    resp.Trailers,
+			"body_handle": p.netAlloc(resp.Body),
+		}))
+	}},
+	{name: ImportNetBodyRead, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if body := p.netGet(args[0]); body != nil {
+			buf := make([]byte, 32*1024)
+			n, err := body.Read(buf)
+			if n > 0 {
+				return okRes(mustJSON(map[string]any{"chunk_b64": base64.StdEncoding.EncodeToString(buf[:n])}))
+			}
+			if errors.Is(err, io.EOF) {
+				return okRes(mustJSON(map[string]any{"eof": true}))
+			}
+			if err != nil {
+				return errRes(err)
+			}
+			// 0,nil:net/http body 不会这样;保守视为流结束。
+			return okRes(mustJSON(map[string]any{"eof": true}))
+		}
+		// 未知/已关句柄:返回 eof,让 guest 侧 Read 得到 io.EOF 收尾。
+		return okRes(mustJSON(map[string]any{"eof": true}))
+	}},
+	{name: ImportNetBodyClose, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		p.netClose(args[0])
 		return okRes(nil)
 	}},
 }

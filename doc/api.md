@@ -16,7 +16,8 @@ type Requires struct { Listens []string; Deps []Dependency; Tools []string }
 type Manifest struct { Meta; Tools []FuncSpec }
 type SlotSpec struct { ID, Doc; Provides, Hooks, Events, Functions, Capabilities, Config,
     Listens, NeedsTools, Needs []string; Builtin bool }
-type FuncSpec struct { Name, Description string; Input, Output json.RawMessage }
+type FuncSpec struct { Name, Description string; Input, Output json.RawMessage;
+    Extensions map[string]json.RawMessage }  // Extensions=自由扩展键值(与 Meta.Extensions 同构)
 type HookPointSpec struct { ID string; Kind HookKind; Desc string; Payload, Result json.RawMessage }
 type EventTopicSpec struct { ID, Description string; Payload json.RawMessage }
 type ConfigFieldSpec struct { Key, Description string; Schema, Default json.RawMessage;
@@ -30,6 +31,8 @@ type Net interface { Request(ctx, Request) (*Response, error); DialStream(ctx, u
 type Request struct { Method, URL string; Headers map[string]string; Body io.Reader }
 type Response struct { Status int; Headers, Trailers map[string]string; Body io.Reader }
 type Stream interface { Send([]byte) error; Recv() ([]byte, error); Context() context.Context }
+type FS interface { ReadFile(name string) ([]byte, error); WriteFile(name string, data []byte) error }  // 全局文件系统注入后端(范围/沙箱由实现定)
+type Storage interface { File(pluginID string) FileStore; KV(pluginID string) KeyValue }
 type OriginKind string   // event | hook | call | host
 type Origin struct { ID, Version string; Kind OriginKind; Point string; At int64 }
 ```
@@ -65,6 +68,7 @@ OnHook(hookID string, fn HookFunc) func()
 Persist() (FileStore, bool)
 KV() (KeyValue, bool)
 Net() (Net, bool)
+FS() (FS, bool)                    // 全局文件系统(fs.read/fs.write 分向门控;装配注入 Options.FS)
 Exec(ctx, cmd string) (string, error)
 Op(ctx, name string, input json.RawMessage) (json.RawMessage, error)
 GetConfig(pluginID, key string) (json.RawMessage, bool)   // 跨插件读配置字段(config.read + 字段 readable)
@@ -119,6 +123,7 @@ type Options[C any] struct {
     Storage contract.Storage   // 持久化注入后端(必填;未注入 → Persist/KV 不可用)
     Net     contract.Net         // 出站网络注入后端(必填;未注入 → Net 不可用)
     NetSchemes []string          // 补充允许的网络 scheme;内置 http/https/ws/wss 恒定;/file:// 等非网络一律拒
+    FS      contract.FS          // 全局文件系统注入后端(nil → Surface.FS 不可用;fs.read/fs.write 分向门控)
     ExecFn  func(ctx, cmd) (string, error)
     Ops     map[string]Op            // 扩展能力: 能力词 → 处理器
     OpAliases map[string]string      // wire 短名 → 守卫能力词
@@ -138,8 +143,8 @@ Register(p contract.Plugin) error                              // 单件注册(�
 RegisterMany(plugs []contract.Plugin) RegisterReport           // 批量+拓扑排序+隔离
 RegisterLazy(p contract.Plugin) (RegisterStatus, error)         // 依赖未满足先入队,到位后自动补载
 // type RegisterStatus int // StatusRegistered | StatusPending
-Replace(p contract.Plugin) error
-Remove(pluginID string, cascade bool) ([]string, error)        // 级联卸载 / fail-closed
+Replace(p contract.Plugin) error                                 // 与 Register 同款契约校验(依赖/槽位),拒换保旧版
+Remove(pluginID string, cascade bool) ([]string, error)          // 级联卸载 / fail-closed(点名与槽位依赖同判;victims 去重)
 Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error) // 含 schema 校验
 SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated(整对象替换)
 SetConfigField(pluginID, key string, value json.RawMessage) error // 单字段合并(再下发)
@@ -171,8 +176,17 @@ type Snapshot struct { Plugins []contract.Meta; Functions []FnView; Capabilities
 
 ```go
 const DefaultMaxPages uint32 = 1024
-type Options struct { MaxMemoryPages uint32; LogFn func(level, msg string) }
+const DefaultMaxEntryBytes int64 = 256 << 20   // zip 单条目解压上限
+const DefaultMaxTotalBytes int64 = 1 << 30     // zip 整包聚合解压上限
+type Options struct {
+    MaxMemoryPages uint32
+    LogFn func(level, msg string)
+    ExtraSuffixes []string   // 追加 zip 包后缀(如品牌 ".x.zip";布局同 .egop.zip;库内不内置业务词)
+    MaxEntryBytes int64      // 0 = DefaultMaxEntryBytes(防 zip bomb)
+    MaxTotalBytes int64      // 0 = DefaultMaxTotalBytes
+}
 
+func IsPluginFile(name string, extra []string) bool               // 后缀判定唯一收敛点(扫描/装载共用)
 func LoadFile(ctx, path string, opts Options) (*Plugin, error)      // 单文件(os)
 func LoadFS(ctx, data []byte, name string, opts Options) (*Plugin, error)  // 直接字节
 func ScanFS(ctx, fsys fs.FS, opts Options) ([]*Plugin, []error)     // fs.FS 遍历
@@ -180,7 +194,12 @@ func ScanDir(ctx, dir string, opts Options) ([]*Plugin, []error)    // = ScanFS(
 
 type Plugin struct{ /* Meta/CallFunc/ApplyConfig/SetSurface/ToolSpecs/ToolRaw/Close */ }
 func (p *Plugin) ToolRaw(name) (func(ctx, tctxJSON, args json.RawMessage) (string, error), bool)
+func (p *Plugin) Assets() map[string][]byte   // zip 内 assets/ 静态资源表副本(裸 wasm = 空表)
 ```
+
+zip 包缺 `plugin.wasm` = **无代码插件**(纯清单/资产):可加载、可注册,声明
+函数/工具/配置/hook 点等需代码兑现的面即拒载;`CallFunc`/`ApplyConfig` 返回
+干净错误(非 panic)。
 
 ## loader/remote
 
@@ -207,26 +226,34 @@ type Session struct{ /* Register/CallFunc/Tool/Hook/ApplyConfig/HostCall/Subscri
 
 op 词汇（`HostCall` 能力回程，与 wasm 宿主注入同构）：`call / get_setting /
 persist_read / persist_write / persist_list / kv_get / kv_put / kv_delete / kv_keys /
-exec / on_hook / publish_event / plugins / get_plugin / get_config / set_config`，
-其余 op 经 `Surface.Op` 透传。事件/过滤统一：`publish_event` 载荷是完整
-`contract.Event` JSON，`subscribe` 帧载荷是完整 `contract.EventFilter`。
+exec / on_hook / publish_event / plugins / get_plugin / get_config / set_config /
+fs_read / fs_write / net_request / net_body_read / net_body_close`，其余 op 经
+`Surface.Op` 透传。事件/过滤统一：`publish_event` 载荷是完整 `contract.Event`
+JSON，`subscribe` 帧载荷是完整 `contract.EventFilter`。`call_func` / `hook` 帧带
+`origin` 字段（调用/触发来源随帧上线，插件侧还原进处理 ctx；加性演进，旧对端
+自然忽略）。
 
 ## autoload（热更目录装载）
 
 ```go
-type Options struct { Interval time.Duration; Logf func(...); FS fs.FS }
+type Options struct { Interval time.Duration; Logf func(...); FS fs.FS; ExtraSuffixes []string }
 type Action string  // register | replace | remove | failed
 type Event struct { Action; PluginID; Path; Version; Err }
 
 func New(hf loader.HostFace, dirs []string, opts Options) *Watcher
 func (w *Watcher) Start(ctx); (w *Watcher) Stop(); (w *Watcher) Poll(ctx) []Event; (w *Watcher) Events() <-chan Event
+func (w *Watcher) Unload(ctx)   // 反注册+关闭全部已加载插件(mount 装配失败全清用;正常关停走宿主总闸)
 ```
+
+增/改/**删**都是两段确认：内容连续两轮一致才装载，文件连续两轮未见才卸载——
+目录瞬态读失败、文件系统抖动不误卸已加载插件。
 
 ## mount（一站式装配）
 
 ```go
 type Sources struct {
     Dirs []string; FS fs.FS                  // wasm 目录(或注入 FS 内的根)
+    ExtraSuffixes []string                   // 追加 zip 包后缀(透传 wasm/autoload)
     Watch bool; Interval time.Duration       // 热更
     Remote []RemoteSpec                       // 出站远程 {ID, Addr}(须配 StreamDial)
     StreamDial   func(ctx, addr string) (remote.Stream, error)   // 注入出站传输
@@ -237,6 +264,10 @@ func Mount(ctx, hf loader.HostFace, src Sources) (*Runtime, []error, error)
 type Runtime struct{ /* Events() <-chan autoload.Event; Close() */ }
 func CheckDirs(ctx, dirs []string) []error   // 离线校验
 ```
+
+装配失败时句柄自行**全清**：停 watcher/会话/入站流，并反注册+关闭目录阶段已
+进册的插件（`Watcher.Unload`），宿主回到装配前状态；正常关停不做反注册——
+注册面归宿主总闸（`Host.Close`）。
 
 ## schema（JSON Schema 子集）
 

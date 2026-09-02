@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,10 @@ import (
 )
 
 // Plugin 是 WASM 插件的宿主侧实体。guest 实例非并发安全,全部跨边界入口
-// (函数/工具/配置/事件回调/关闭)经 mu 串行化;宿主注入函数在同一把锁内执行,不可重入取锁。
+// (函数/工具/配置/关闭)经 mu 串行化;宿主注入函数在同一把锁内执行,不可重入取锁。
+// 事件/hook 回调例外:它们可能在 guest 调用持锁期间被同步扇出重入(插件发布命中
+// 自身订阅的事件),故经 TryLock 探测——锁忙即归一为"未送达"(事件丢弃/hook 记
+// Reason),绝不阻塞重入,否则同 goroutine 对非重入锁二次上锁即死锁。
 type Plugin struct {
 	name     string // 展示名(通常为文件名)
 	manifest contract.Manifest
@@ -33,10 +37,39 @@ type Plugin struct {
 	logFn    func(level, msg string)
 	unsubs   undo.Catcher // 事件订阅撤销统一栈(Close 释放)
 	broken   atomic.Bool  // 实例已关闭/被取消:后续调用 fail-closed
+
+	netSeq    int64                // 出站流式 body 句柄序号(guard 下自增)
+	netBodies map[string]io.Reader // 句柄 → 未读完的响应 body(ImportNetBodyRead/Close 消费)
 }
 
 func newPlugin(name string) *Plugin {
-	return &Plugin{name: name, assets: map[string][]byte{}}
+	return &Plugin{name: name, assets: map[string][]byte{}, netBodies: map[string]io.Reader{}}
+}
+
+// netAlloc 登记一条流式响应 body,返回字符串句柄(仅在宿主注入函数内、持锁时调用)。
+func (p *Plugin) netAlloc(r io.Reader) string {
+	p.netSeq++
+	key := fmt.Sprintf("%d", p.netSeq)
+	p.netBodies[key] = r
+	return key
+}
+
+// netGet 取句柄对应的 body 读端;未知/已关返回 nil。
+func (p *Plugin) netGet(handle string) io.Reader {
+	if p.netBodies == nil {
+		return nil
+	}
+	return p.netBodies[handle]
+}
+
+// netClose 关闭并遗忘一条 body 句柄(幂等;body 若未实现 io.Closer 仅遗忘)。
+func (p *Plugin) netClose(handle string) {
+	if b, ok := p.netBodies[handle]; ok {
+		if c, ok := b.(io.Closer); ok {
+			_ = c.Close()
+		}
+		delete(p.netBodies, handle)
+	}
 }
 
 // asset 读打包静态资源(宿主注入函数上下文:已持锁)。
@@ -51,8 +84,23 @@ func (p *Plugin) recordUnsub(fn func()) { p.unsubs.Defer(fn) }
 // Meta 实现 base.Plugin。
 func (p *Plugin) Meta() contract.Meta { return p.manifest.Meta }
 
+// Assets 返回 .egop.zip 内 assets/ 静态资源表的只读副本(资源名→字节)。
+// 宿主据此下发插件自带的静态资产(如 UI 入口 JS);裸 .egop.wasm 形态返回空表。
+// 返回值是副本:调用方改 map 不影响插件内部;字节切片本身视为只读。
+func (p *Plugin) Assets() map[string][]byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string][]byte, len(p.assets))
+	for k, v := range p.assets {
+		out[k] = v
+	}
+	return out
+}
+
 // Config 实现 contract.ConfigProvider:调 guest 的 egop_get_config 导出读回当前生效
 // 配置(权威读回);未导出/失败返回 nil → 宿主 EffectiveConfig 回退 applied 缓存。
+// 注意:egop_get_config 与 egop_meta 一样是"裸 JSON 读回"通道(非 err 信封)——见
+// SDK guest 的 egopGetConfigExport 与本包 testdata/config.wat。
 func (p *Plugin) Config() json.RawMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -81,7 +129,19 @@ func (p *Plugin) Config() json.RawMessage {
 func (p *Plugin) CallFunc(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.callExportLocked(ctx, ExportCall, fname, string(input))
+	if p.mod == nil {
+		return nil, fmt.Errorf("wasm plugin %s: codeless bundle has no callable functions", p.name)
+	}
+	args := []string{fname, string(input)}
+	// egop_call ABI 两版:4 参(fname,in)= 旧版 / 6 参(+origin)= 新版(第 3 参=
+	// 调用方来源 Origin 裸 JSON,SDK guest 读它并 WithOrigin 还原,使插件函数能经
+	// OriginFrom 知道"谁调了我";ctx 本身无法跨 wasm ABI)。精确匹配 6 才传第三参;
+	// 其它非法元数在装载期 validate 已按 ABI 不合规拒载。
+	if fn := p.mod.ExportedFunction(ExportCall); fn != nil && len(fn.Definition().ParamTypes()) == 6 {
+		originJSON, _ := json.Marshal(contract.OriginFrom(ctx))
+		args = append(args, string(originJSON))
+	}
+	return p.callExportLocked(ctx, ExportCall, args...)
 }
 
 // ToolSpecs 实现 base.ToolProvider(来自线上清单 Manifest.Tools)。
@@ -119,10 +179,14 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
-// ApplyConfig 实现 base.Configurable(guest 未导出 egop_apply_config 时拒绝下发)。
+// ApplyConfig 实现 base.Configurable(guest 未导出 egop_apply_config 时拒绝下发;
+// 无代码包无 guest 可下发,返回干净错误而非 nil 解引用)。
 func (p *Plugin) ApplyConfig(cfg json.RawMessage) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.mod == nil {
+		return fmt.Errorf("wasm plugin %s: codeless bundle is not configurable", p.name)
+	}
 	if p.mod.ExportedFunction(ExportApplyConfig) == nil {
 		return fmt.Errorf("wasm plugin %s: export %q missing (not configurable)", p.name, ExportApplyConfig)
 	}
@@ -152,8 +216,13 @@ func (p *Plugin) SetSurface(s contract.Surface) {
 
 // pushEvent 是订阅回调:把事件经 egop_on_event 推给 guest(尽力而为,未导出回调则丢弃)。
 // 统一事件结构:整个 contract.Event(含 Source/Labels)JSON 作为单参传给 guest。
+// 投递用 TryLock:事件总线同步扇出,回调可能落在"guest 自己正持锁调用中"的
+// goroutine 上(插件发布了命中自身订阅的事件)——阻塞取锁即同 goroutine 重入死锁。
+// 锁忙 = 本次投递丢弃(best-effort 观察面语义;不阻塞总线、不殃及其它订阅者)。
 func (p *Plugin) pushEvent(ctx context.Context, _ string, e contract.Event) {
-	p.mu.Lock()
+	if !p.mu.TryLock() {
+		return
+	}
 	defer p.mu.Unlock()
 	if p.broken.Load() || p.mod == nil {
 		return
@@ -175,8 +244,12 @@ func (p *Plugin) pushEvent(ctx context.Context, _ string, e contract.Event) {
 
 // invokeHook 把 hook 触发转发给 guest 的 egop_on_hook 导出,解其返回信封的
 // result 得到 HookResult(Block/Reason/Data;Who/At/Seq 由框架回填)。
+// 取锁用 TryLock(同 pushEvent:hook 触发可能同步重入持锁中的 guest 调用,阻塞
+// 即死锁);锁忙归一为非阻断 HookResult{Reason},触发方继续、hook 链不断。
 func (p *Plugin) invokeHook(ctx context.Context, hookID string, data json.RawMessage) any {
-	p.mu.Lock()
+	if !p.mu.TryLock() {
+		return contract.HookResult{Reason: "wasm plugin " + p.name + ": instance busy (hook skipped to avoid reentrant deadlock)"}
+	}
 	defer p.mu.Unlock()
 	if p.broken.Load() || p.mod == nil {
 		return contract.HookResult{Reason: "instance closed"}
@@ -186,6 +259,13 @@ func (p *Plugin) invokeHook(ctx context.Context, hookID string, data json.RawMes
 		return contract.HookResult{}
 	}
 	args := []string{hookID, string(data)}
+	// egop_on_hook 第 3 参=触发来源 Origin(裸 JSON,精确 6 参才传,同 egop_call):
+	// SDK guest 读它并 WithOrigin 还原,使 hook 回调也能经 OriginFrom 知道
+	// "哪个框架点触发/谁触发"。老 WAT 夹具 4 参则跳过。
+	if len(fn.Definition().ParamTypes()) == 6 {
+		originJSON, _ := json.Marshal(contract.OriginFrom(ctx))
+		args = append(args, string(originJSON))
+	}
 	params := make([]uint64, 0, 4)
 	for _, a := range args {
 		ptr, err := allocWriteGuest(ctx, p.mod, []byte(a))
@@ -245,6 +325,9 @@ func (p *Plugin) Close(ctx context.Context) error {
 		if err := p.runtime.Close(ctx); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	for h := range p.netBodies {
+		p.netClose(h)
 	}
 	p.broken.Store(true)
 	return errors.Join(errs...)

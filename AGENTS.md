@@ -49,10 +49,18 @@ examples  ← 可跑示例,禁止示例里引入业务假设
   (string,error),bool)`。tctx = 线上 JSON;typed 包装(tctx 序列化)永远在
   **消费方装配层**,禁止在 loader 里引任何会话上下文类型。
 - **SubscribeEvent 回调带 topic**:`func(ctx, topic string, e Event) func()`。
-- **热更两段确认**:连续两轮 hash 一致才应用(抗半截写),替换失败必须回退
-  保旧版——这些语义有测试固化,勿"顺手简化"。
+- **事件/hook 投递不重入取锁**:总线同步扇出可能在"guest 自己正持实例锁调用中"
+  的同一 goroutine 上重入投递(插件发布命中自身订阅的事件)——wasm 侧
+  `pushEvent`/`invokeHook` 一律 `TryLock`,锁忙即跳过本次投递(事件丢弃/hook 记
+  Reason,best-effort),绝不阻塞取锁(对非重入锁自死锁,有 selfpub 夹具测试固化)。
+- **热更两段确认**:增/改连续两轮 hash 一致才应用(抗半截写),**删连续两轮未见
+  才卸载**(抗目录瞬态读失败误卸);替换失败必须回退保旧版,且 `Replace` 过与
+  `Register` 同款契约校验(DepInit 依赖/槽位八轴)——替换口不得比注册口宽松。
+  这些语义有测试固化,勿"顺手简化"。
 - **关停语义**:`Host.Close` 逆注册序 + Disposer 清退;Remove(cascade=false)
-  被依赖时 fail-closed。
+  被依赖时 fail-closed——点名依赖与**槽位依赖**同判(按"删除后槽位是否仍有其它
+  供给"精确判定,槽位名与插件 id 是两个命名空间,勿直接相等比较);级联 victims
+  去重,`plugin.removed` 每插件只广播一次。
 - **批量装载**:`host.RegisterMany` 按 `Requires`(DepInit,Plugin/Slot) 拓扑排序
   后依序注册,失败隔离(缺依赖/成环/重复 id 单独失败);`mount` 首装拍至稳定、
   `autoload` 依赖后到自动补载——均有测试固化,勿回退成固定次数/固定顺序。
@@ -83,7 +91,14 @@ testdata/demo.wasm 副本,同步重编无缝)。远程通道(loader/remote)不�
   `mount.Sources.FS` 承载读侧(目录发现/读取字节)解耦——勿在本库读路径重新引入
   `os.ReadFile`/`filepath.WalkDir`(js/wasm 虽能编译,运行时会失败)。"直接给内容"
   走 `wasm.LoadFS(字节)`;网络注入走 `host.Options.Net`(`Surface.Net()`,
-  出站目标须是网络协议,`file://` 等被协议门拒绝)。
+  出站目标须是网络协议,`file://` 等被协议门拒绝);全局文件系统注入走
+  `host.Options.FS`(`Surface.FS()`,`fs.read`/`fs.write` 分向门控,范围/沙箱由
+  注入实现决定)。
+- **品牌/业务词不进库**:插件包后缀只内置 `*.egop.wasm` / `*.egop.zip`,其它
+  后缀(品牌 zip 等)经 `wasm.Options.ExtraSuffixes` → `autoload.Options` →
+  `mount.Sources` 装配注入;后缀判定收敛在 `wasm.IsPluginFile` 单点,勿在
+  扫描/装载侧各写一套。zip 解压有上限(`MaxEntryBytes`/`MaxTotalBytes`,防
+  zip bomb),资产名拒绝 `..` 穿越——插件是不可信输入,勿移除这些防线。
 
 ## 验收标准(任何改动)
 

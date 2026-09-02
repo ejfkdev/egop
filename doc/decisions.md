@@ -59,3 +59,43 @@ wasm guest 无 ctx——事件里真正有用的存根（`Source`/`Labels`/`Payl
 「推了什么」，不等于「插件实际跑在什么配置上」。`ConfigFieldSpec.Default` 是**声明级默认值**
 （供 web UI 展示/回填），运行时真实默认仍以插件 `Config()` 为准。写侧语义显式区分：
 `Host.SetConfig` = 整对象替换，`Host.SetConfigField`（及门控的 `Surface.SetConfig`）= 单字段合并。
+## 11. wasm 事件/hook 投递不重入取锁（TryLock，锁忙即跳过）
+
+决策 1 的同步扇出保留，但 wasm 侧 `pushEvent`/`invokeHook` 用 `TryLock` 而非阻塞取锁。
+原因：同步扇出会在**发布者自己的 goroutine** 上执行订阅回调——「guest 调用中发布命中
+自身订阅的事件」即同 goroutine 重入实例锁，对非重入的 `sync.Mutex` 就是永久死锁
+（有 `testdata/selfpub.wat` 夹具回归固化）。备选的「每插件异步投递队列」保投递但引入
+goroutine 生命周期/背压/顺序问题，且只对 wasm 世界有意义（进程内/远程插件不持实例锁），
+收益与复杂度不成比例——事件本就是 best-effort 观察面，丢弃一致于「投递失败静默」。
+代价（显式接受）：实例忙时**并发**发布的事件也会被丢弃而非排队；hook 锁忙时返回
+非阻断 `HookResult{Reason:"instance busy"}`，触发链不断。
+
+## 12. 槽位依赖的卸载判定：按「删除后槽位是否仍被满足」
+
+`Remove`/`Dependents` 对 `DepInit{Slot}` 依赖不做「被删插件曾占据该槽位即连坐」的
+过度拒绝，而是精确判定：删除后槽位仍有其它在册主张者（或内置）→ 依赖未破坏。
+只有删**唯一供给者**才 fail-closed/级联。槽位名与插件 id 是两个命名空间，判定必须拿
+被删插件的 `Meta.Slot` 去比（曾经直接 `r.Slot == pluginID` 比较，是判不出的 bug）。
+
+## 13. `Replace` 与 `Register` 同款契约校验
+
+热替换口不得比注册口宽松：`DepInit` 依赖就位与槽位八轴最小契约在 `Replace` 里同样
+强制（共用 `validateContractLocked`）。校验失败拒换、旧版原样在册——与热更「替换失败
+回退保旧版」语义同构。曾经 `Replace` 零校验，坏包可从热更口静默绕过契约。
+
+## 14. 删除也是两段确认；mount 装配失败全清
+
+与增/改的两段确认对称：文件**连续两轮未见**才卸载——目录瞬态读失败、文件系统抖动
+不再一轮误卸全部插件（曾经 WalkDir 失败 → seen 为空 → 全量立即卸载）。代价：卸载
+延迟多一个轮询周期。`mount.Mount` 失败路径（出站拨号/注册失败）额外做全清：
+`Watcher.Unload` 反注册并**关闭句柄**（wazero runtime 不泄漏），宿主回到装配前状态；
+正常关停（`Runtime.Close`）不做反注册——注册面归宿主总闸（`Host.Close`），避免双重
+清退的所有权混乱。
+
+## 15. 插件包是不可信输入：zip 上限与后缀注入
+
+zip 解压设单条目/聚合双上限（默认 256MiB/1GiB，头部声明预检 + 读取硬限，谎报尺寸
+也兜得住），资产名拒绝绝对路径与 `..` 穿越（zip-slip 防在源头，消费方拿 `Assets()`
+落盘服务也安全）。包后缀只内置 `.egop.wasm`/`.egop.zip`：品牌/项目自有后缀经
+`Options.ExtraSuffixes` 装配注入（内容无关库不内置业务词），判定收敛在
+`wasm.IsPluginFile` 单点——扫描侧与装载侧永不分叉。

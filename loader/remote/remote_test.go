@@ -6,8 +6,12 @@ package remote
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -563,5 +567,172 @@ func TestInboundConfigAndMetaOps(t *testing.T) {
 	}
 	if _, err := sess.HostCall(context.Background(), OpSetConfig, json.RawMessage(`{"plugin_id":"svc.cfg","key":"public","value":"nope"}`)); err == nil {
 		t.Fatal("public (writable=false) should reject writes")
+	}
+}
+
+// ---------- 出站网络三 op + 全局 FS 两 op + Origin 帧字段(与 wasm ABI 对称) ----------
+
+// fakePipeNet 是出站网络注入后端(内存假实现:测试聚焦 op 通道与门控,非传输)。
+type fakePipeNet struct{}
+
+func (fakePipeNet) Request(_ context.Context, req contract.Request) (*contract.Response, error) {
+	body := "resp-body"
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		body = "echo:" + string(b)
+	}
+	return &contract.Response{
+		Status:   201,
+		Headers:  map[string]string{"X-H": "v"},
+		Trailers: map[string]string{"grpc-status": "0"},
+		Body:     strings.NewReader(body),
+	}, nil
+}
+
+func (fakePipeNet) DialStream(context.Context, string, map[string]string) (contract.Stream, error) {
+	return nil, errors.New("fakePipeNet: dial not used in this test")
+}
+
+// memFSBackend 是全局文件系统注入后端(内存假实现)。
+type memFSBackend struct {
+	mu    sync.Mutex
+	files map[string][]byte
+}
+
+func (m *memFSBackend) ReadFile(name string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.files[name]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return b, nil
+}
+
+func (m *memFSBackend) WriteFile(name string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.files == nil {
+		m.files = map[string][]byte{}
+	}
+	m.files[name] = data
+	return nil
+}
+
+func TestInboundNetAndFSOps(t *testing.T) {
+	back := &memFSBackend{files: map[string][]byte{"a.txt": []byte("alpha")}}
+	h := host.New[any](host.Options[any]{Events: newEvBus(), Net: fakePipeNet{}, FS: back})
+	mf := loadManifest(t, `{"id":"remote.nf","name":"NF","version":"1","provides":{"capabilities":["net.access","fs.read","fs.write"],"functions":[{"name":"who"}]}}`)
+	ops := &PluginOps{
+		CallFunc: func(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+			// Origin 帧字段回归:框架侧注入的调用来源经线上还原进处理 ctx。
+			o := contract.OriginFrom(ctx)
+			if o == nil {
+				return json.RawMessage(`"no-origin"`), nil
+			}
+			return json.RawMessage(`"` + string(o.Kind) + `"`), nil
+		},
+	}
+	sess, err := AttachStream(context.Background(), inboundPipe(t, h, ""), mf, ops)
+	if err != nil {
+		t.Fatalf("AttachStream: %v", err)
+	}
+	defer sess.Close()
+	waitFor(t, 2*time.Second, func() bool { return h.HasPlugin("remote.nf") })
+
+	// net_request:整包请求体(b64)上线,响应回 status/headers/trailers/body_handle。
+	reqBody := base64.StdEncoding.EncodeToString([]byte("hi"))
+	out, err := sess.HostCall(context.Background(), OpNetRequest,
+		json.RawMessage(`{"method":"POST","url":"https://svc/y","headers":{"A":"B"},"body_b64":"`+reqBody+`"}`))
+	if err != nil {
+		t.Fatalf("HostCall(net_request): %v", err)
+	}
+	var resp struct {
+		Status     int               `json:"status"`
+		Headers    map[string]string `json:"headers"`
+		Trailers   map[string]string `json:"trailers"`
+		BodyHandle string            `json:"body_handle"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("net_request result = %s (%v)", out, err)
+	}
+	if resp.Status != 201 || resp.Headers["X-H"] != "v" || resp.Trailers["grpc-status"] != "0" || resp.BodyHandle == "" {
+		t.Fatalf("net_request result = %+v", resp)
+	}
+	// net_body_read:流式读回 chunk(b64)直至 eof。
+	readOut, err := sess.HostCall(context.Background(), OpNetBodyRead,
+		json.RawMessage(`{"handle":"`+resp.BodyHandle+`"}`))
+	if err != nil {
+		t.Fatalf("HostCall(net_body_read): %v", err)
+	}
+	var chunk struct {
+		ChunkB64 string `json:"chunk_b64"`
+		EOF      bool   `json:"eof"`
+	}
+	if err := json.Unmarshal(readOut, &chunk); err != nil || chunk.ChunkB64 == "" {
+		t.Fatalf("net_body_read = %s (%v)", readOut, err)
+	}
+	if got, _ := base64.StdEncoding.DecodeString(chunk.ChunkB64); string(got) != "echo:hi" {
+		t.Fatalf("chunk = %q", got)
+	}
+	eofOut, err := sess.HostCall(context.Background(), OpNetBodyRead,
+		json.RawMessage(`{"handle":"`+resp.BodyHandle+`"}`))
+	if err != nil || !strings.Contains(string(eofOut), `"eof":true`) {
+		t.Fatalf("net_body_read(eof) = %s (%v)", eofOut, err)
+	}
+	if _, err := sess.HostCall(context.Background(), OpNetBodyClose,
+		json.RawMessage(`{"handle":"`+resp.BodyHandle+`"}`)); err != nil {
+		t.Fatalf("HostCall(net_body_close): %v", err)
+	}
+
+	// fs_read / fs_write:分向能力面经回程可用。
+	fsOut, err := sess.HostCall(context.Background(), OpFSRead, json.RawMessage(`{"name":"a.txt"}`))
+	if err != nil {
+		t.Fatalf("HostCall(fs_read): %v", err)
+	}
+	var fsRes struct {
+		DataB64 string `json:"data_b64"`
+	}
+	if err := json.Unmarshal(fsOut, &fsRes); err != nil {
+		t.Fatalf("fs_read = %s (%v)", fsOut, err)
+	}
+	if got, _ := base64.StdEncoding.DecodeString(fsRes.DataB64); string(got) != "alpha" {
+		t.Fatalf("fs_read data = %q", got)
+	}
+	wData := base64.StdEncoding.EncodeToString([]byte("beta"))
+	if _, err := sess.HostCall(context.Background(), OpFSWrite,
+		json.RawMessage(`{"name":"b.txt","data_b64":"`+wData+`"}`)); err != nil {
+		t.Fatalf("HostCall(fs_write): %v", err)
+	}
+	if b, _ := back.ReadFile("b.txt"); string(b) != "beta" {
+		t.Fatalf("backend b.txt = %q", b)
+	}
+
+	// Origin 帧字段:框架直调(Kind=host)在插件侧 ctx 可经 OriginFrom 读回。
+	kindOut, err := h.Call(context.Background(), "remote.nf", "who", nil)
+	if err != nil {
+		t.Fatalf("Call(who): %v", err)
+	}
+	if string(kindOut) != `"host"` {
+		t.Fatalf("origin kind on plugin side = %s (want \"host\")", kindOut)
+	}
+}
+
+// TestInboundNetOpsGated 未声明 net.access/fs.* 的远程插件:三 op/两 op 一律拒绝。
+func TestInboundNetOpsGated(t *testing.T) {
+	h := host.New[any](host.Options[any]{Events: newEvBus(), Net: fakePipeNet{}, FS: &memFSBackend{}})
+	mf := loadManifest(t, remoteDemoManifest) // 能力:plugin.call/event/storage.kv——无 net/fs
+	sess, err := AttachStream(context.Background(), inboundPipe(t, h, ""), mf, &PluginOps{})
+	if err != nil {
+		t.Fatalf("AttachStream: %v", err)
+	}
+	defer sess.Close()
+	waitFor(t, 2*time.Second, func() bool { return h.HasPlugin("remote.demo") })
+
+	if _, err := sess.HostCall(context.Background(), OpNetRequest, json.RawMessage(`{"method":"GET","url":"https://x"}`)); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("net_request gate err = %v", err)
+	}
+	if _, err := sess.HostCall(context.Background(), OpFSRead, json.RawMessage(`{"name":"a"}`)); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("fs_read gate err = %v", err)
 	}
 }

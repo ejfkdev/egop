@@ -129,7 +129,9 @@ The design follows three cordis mechanisms, mapped onto Go:
 - `schema` — preset structure catalog + a generic JSON Schema subset validator
   (`Validate`, supports type arrays and `anyOf`).
 - `loader/wasm` — loads `*.egop.wasm` (embedded `egop.manifest` custom section, falling back
-  to the `egop_meta` export) and `*.egop.zip` (manifest.json + plugin.wasm + assets/);
+  to the `egop_meta` export) and `*.egop.zip` (manifest.json + plugin.wasm + assets/;
+  plugin.wasm is optional — a zip without it is a **codeless bundle**: pure manifest/assets,
+  e.g. UI plugins); extra zip suffixes (brand conventions) inject via `Options.ExtraSuffixes`;
   directory discovery via `ScanDir`.
 - `loader/remote` — transport-agnostic remote channel: egop only sends/receives JSON frames
   on an injected `remote.Stream`; the connection is established externally.
@@ -223,7 +225,8 @@ At registration the host injects a Surface view trimmed by `Meta.Capabilities`:
 `Call` (`plugin.call`), `Plugins`/`GetPlugin` (`plugin.meta`), `GetConfig`/`SetConfig`
 (`config.read`/`config.write`), `PublishEvent`/`SubscribeEvent`/`SubscribeEventFilter`
 (`event.emit`/`event.listen`), `Persist`/`KV` (`storage.persist`/`storage.kv`), `Exec`
-(`exec.cmd`), `Net` (`net.access`), and `Op` for injected extensions.
+(`exec.cmd`), `Net` (`net.access`), `FS` (`fs.read`/`fs.write` — injected host filesystem
+view, gated per direction), and `Op` for injected extensions.
 
 `Host.SurfaceFor(pluginID)` exports the same view — remote plugins' capability callbacks
 route through it with identical gating semantics.

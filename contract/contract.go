@@ -19,10 +19,12 @@ const (
 	CapPluginMeta    = "plugin.meta"     // 读插件目录/其它插件元数据
 	CapEmitsEvents   = "event.emit"      // 发布事件
 	CapListensEvents = "event.listen"    // 订阅事件广播
-	CapPersist       = "storage.persist" // 插件专属文件读写
+	CapPersist       = "storage.persist" // 插件专属文件读写(隔离目录)
 	CapKV            = "storage.kv"      // 插件专属 KV
 	CapExec          = "exec.cmd"        // 执行命令
 	CapNet           = "net.access"      // 出站网络(HTTP/HTTPS/SSE/WebSocket/WebTransport 等,经 Net 注入)
+	CapFSRead        = "fs.read"         // 全局文件系统读取(经 FS 注入;区别于 storage.persist 的插件专属隔离目录)
+	CapFSWrite       = "fs.write"        // 全局文件系统写入(同上;读写分别门控)
 	CapTools         = "tool.provide"    // 向工具面提供工具
 	CapConfigRead    = "config.read"     // 读其它插件的声明配置字段
 	CapConfigWrite   = "config.write"    // 写其它插件的声明配置字段
@@ -168,6 +170,10 @@ type FuncSpec struct {
 	Description string          `json:"description,omitempty"`
 	Input       json.RawMessage `json:"input,omitempty"`  // 入参 JSON Schema
 	Output      json.RawMessage `json:"output,omitempty"` // 返回 JSON Schema
+	// Extensions 自由扩展键值(非契约轴):同一可调用体的业务元数据/自定义声明,
+	// egop 不解释、不校验,只在 JSON 契约里原样透传。上层(如 eha)按 key 读取
+	// 自己的语义(值是否 JSON 由上层约定)。与 Meta.Extensions 同构。
+	Extensions map[string]json.RawMessage `json:"extensions,omitempty"`
 }
 
 type HookKind string
@@ -400,6 +406,16 @@ type Storage interface {
 	KV(pluginID string) KeyValue
 }
 
+// FS 是插件**全局文件系统**面的注入后端(与 Storage/Net 同一注入哲学:egop 只定义
+// 最小面、不实现任何平台 IO)。与 storage.persist 的插件专属隔离目录不同,这是装配层
+// 授予插件的一个显式受控主机文件视图——可见范围/沙箱/路径白名单策略完全由实现决定
+// (装配层可给 io/fs.Sub 的子树视图、只读镜像等)。读写分别门控(fs.read / fs.write):
+// 能力判定在 Surface 视图层做,未声明者拿不到面/写被拒;实现只需关心 IO 语义。
+type FS interface {
+	ReadFile(name string) ([]byte, error)
+	WriteFile(name string, data []byte) error
+}
+
 // Stream 是双向二进制消息流的最小面:一条消息 = 一次 Send/Recv。
 // 同一形状覆盖 WebSocket 消息、WebRTC DataChannel、WebTransport 双向流、
 // MQTT-over-WS(插件在消息体里自述 MQTT 语义)等所有"消息型"传输——
@@ -463,6 +479,10 @@ type Surface interface {
 	Persist() (FileStore, bool)
 	KV() (KeyValue, bool)
 	Net() (Net, bool) // 出站网络(需 net.access 能力且装配层注入 Net)
+	// FS 返回全局文件系统面(需 fs.read / fs.write 至少其一,且装配层注入 FS)。
+	// 读写按声明分别门控:未声明 fs.read 时 ReadFile 报错,未声明 fs.write 时
+	// WriteFile 报错(先说后做,与 Net 协议门同款单点强制)。
+	FS() (FS, bool)
 	Exec(ctx context.Context, cmd string) (string, error)
 	Op(ctx context.Context, name string, input json.RawMessage) (json.RawMessage, error)
 	// GetConfig 读其它插件声明的一个配置字段。需 caller 声明 config.read 能力,且

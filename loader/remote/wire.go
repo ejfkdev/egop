@@ -54,6 +54,14 @@ const (
 	OpGetPlugin    = "get_plugin"
 	OpGetConfig    = "get_config"
 	OpSetConfig    = "set_config"
+	OpFSRead       = "fs_read"
+	OpFSWrite      = "fs_write"
+	// OpNetRequest / OpNetBodyRead / OpNetBodyClose 出站网络三 op(与 wasm ABI
+	// net_request/net_body_read/net_body_close 同词汇同形状;响应 body 流式读,
+	// chunk 走 base64)。
+	OpNetRequest   = "net_request"
+	OpNetBodyRead  = "net_body_read"
+	OpNetBodyClose = "net_body_close"
 )
 
 // HostCall 各 op 的参数 JSON 形状。
@@ -80,6 +88,9 @@ type (
 	execArgs struct {
 		Cmd string `json:"cmd"`
 	}
+	handleArgs struct {
+		Handle string `json:"handle"`
+	}
 	publishArgs struct {
 		Topic   string            `json:"topic"`
 		SubType string            `json:"sub_type,omitempty"`
@@ -87,6 +98,10 @@ type (
 		Payload json.RawMessage   `json:"payload"`
 	}
 )
+
+// netChunkSize 是 net_body_read 单次读取上限(与 wasm ABI 同款 32KiB;chunk 走
+// base64,单帧远小于 maxFrameSize)。
+const netChunkSize = 32 * 1024
 
 // decodeEnvelope 解结果信封;信封错误 → error。
 func decodeEnvelope(payload json.RawMessage) (json.RawMessage, error) {

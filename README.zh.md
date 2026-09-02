@@ -121,8 +121,9 @@ defer rt.Close()
 - `schema`——预设结构目录（注册 Go 结构作为参考形状）+ 配置/函数入参返回的通用
   JSON Schema 子集校验（`Validate`,支持 `type` 数组 / `anyOf` 多格式）。
 - `loader/wasm`——`*.egop.wasm`（自定义段 `egop.manifest` 内嵌清单,缺省回退
-  `egop_meta` 导出）与 `*.egop.zip`（manifest.json+plugin.wasm+assets/）加载;
-  目录递归发现 `ScanDir`。
+  `egop_meta` 导出）与 `*.egop.zip`（manifest.json+plugin.wasm+assets/;plugin.wasm
+  可缺省——无代码插件:纯清单/资产,如 UI 插件）加载;品牌 zip 后缀经
+  `Options.ExtraSuffixes` 装配注入;目录递归发现 `ScanDir`。
 - `loader/remote`——远程通道(传输无关):egop 只在注入的 `remote.Stream` 上收发 JSON
   帧,连接由外部建立;框架主动拨插件 / 插件主动拨框架同帧表,注册流双工复用。
 - `loader`——统一宿主面 `loader.HostFace`:装配组件(autoload/mount/remote)
@@ -256,6 +257,8 @@ defer rt.Close()
 - `Exec`（`exec.cmd`）——执行命令(注入 `ExecFn`);
 - `Net`（`net.access`）——出站网络(HTTP/HTTPS/SSE/WebSocket/WebTransport 等,经 `Options.Net` 注入,
   egop 只定义最小面与数据结构、不实现传输;且出站目标须是网络协议,`file://` 等本地访问被拒);
+- `FS`（`fs.read`/`fs.write`）——全局文件系统受控视图(经 `Options.FS` 注入;范围/沙箱
+  策略由实现决定,读写按声明分向门控;区别于 `storage.persist` 的插件专属隔离目录);
 - `Op(ctx, name, input)`（扩展能力,核心零业务）——wire 短名经
   `Options.OpAliases` 映射到守卫能力词再查处理器;装配层注入 `Ops`。
 
