@@ -246,3 +246,57 @@ func TestPollLoadsLateDependency(t *testing.T) {
 		t.Fatalf("A then B should both load: evs=%v plugins=%v", evs, h.Plugins())
 	}
 }
+
+// TestExtraSuffixesDiscovery 品牌/项目自有 zip 后缀经 Options.ExtraSuffixes 注入:
+// 注入后目录发现+装载贯通;未注入时同一文件被忽略(内容无关库不内置业务词)。
+func TestExtraSuffixesDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	writeZip(t, dir, "demo.brand.zip", demoManifest, demoModule(t))
+
+	// 未注入:忽略(不注册、无事件)。
+	w0 := New(coreHost(t), []string{dir}, Options{})
+	if evs := settle(t, w0, 3); len(evs) != 0 {
+		t.Fatalf("un-injected suffix must be ignored, events = %v", evs)
+	}
+
+	// 注入 ".brand.zip":两段确认后照常装载。
+	h := coreHost(t)
+	w := New(h, []string{dir}, Options{ExtraSuffixes: []string{".brand.zip"}})
+	evs := settle(t, w, 3)
+	if !hasAction(t, evs, ActionRegister) || !h.HasPlugin("wasm.demo") {
+		t.Fatalf("injected suffix not loaded: events=%v plugins=%v", evs, h.Plugins())
+	}
+	w.Stop()
+	w.Unload(context.Background())
+}
+
+// TestUnloadUnregistersAndCloses Watcher.Unload(mount 装配失败全清路径):
+// 已加载插件全部反注册、句柄关闭;幂等;正常 Stop 不触发这些。
+func TestUnloadUnregistersAndCloses(t *testing.T) {
+	h := coreHost(t)
+	dir := t.TempDir()
+	writeZip(t, dir, "demo.egop.zip", demoManifest, demoModule(t))
+	w := New(h, []string{dir}, Options{})
+	settle(t, w, 3)
+	if !h.HasPlugin("wasm.demo") {
+		t.Fatal("initial register failed")
+	}
+	// Stop 只停轮询,注册面不动(归宿主总闸)。
+	w.Stop()
+	if !h.HasPlugin("wasm.demo") {
+		t.Fatal("Stop must not unregister")
+	}
+	// Unload:反注册 + 关句柄(Close 后实例 broken,再调用 fail-closed)。
+	w.Unload(context.Background())
+	if h.HasPlugin("wasm.demo") {
+		t.Fatal("Unload must unregister loaded plugins")
+	}
+	w.mu.Lock()
+	remaining := len(w.units)
+	w.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("units left after Unload = %d", remaining)
+	}
+	// 幂等:再调是空操作。
+	w.Unload(context.Background())
+}

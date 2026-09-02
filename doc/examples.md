@@ -15,8 +15,10 @@
 | `config` | 配置 + 函数 schema 校验（默认开） | `go run .` |
 | `capabilities` | 能力面 `Surface` + 扩展 `Op` | `go run .` |
 | `net` | 出站网络 `Net`（Request / DialStream + 协议门） | `go run .` |
+| `fsaccess` | 全局文件系统 `FS`（fs.read/fs.write 分向门控 + 后端沙箱） | `go run .` |
 | `exchange` | 信封翻译表 `Register`/`NewEvent`/`Decode` | `go run .` |
 | `fs` | `io/fs.FS` 注入（跨平台读插件字节） | `go run .` |
+| `codeless` | 无代码资源包（缺 plugin.wasm 的 zip + ExtraSuffixes + Assets/Extensions） | `go run .` |
 | `storage` | 插件专属持久化 `Storage` 注入（Persist/KV） | `go run .` |
 | `wasm` | 最小 `*.egop.wasm` 插件 | `go test .` |
 | `rawconn` | 远程通道裸字节流（传输无关） | `go run .` |

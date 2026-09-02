@@ -274,3 +274,65 @@ func TestMountStreamDialInjected(t *testing.T) {
 		t.Fatalf("echo = %s, %v", out, err)
 	}
 }
+
+// TestMountExtraSuffixes 品牌 zip 后缀经 Sources.ExtraSuffixes 注入,贯通
+// mount → autoload → wasm 三层(首装即按注入后缀发现装载)。
+func TestMountExtraSuffixes(t *testing.T) {
+	hf, h := mountHost(t)
+	dir := t.TempDir()
+	writeZip(t, dir, "demo.brand.zip", demoManifest, demoModule(t))
+
+	// 未注入:该后缀被忽略,不装载。
+	rt, warns, err := Mount(context.Background(), hf, Sources{Dirs: []string{dir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warns) != 0 || h.HasPlugin("wasm.demo") {
+		t.Fatalf("un-injected suffix loaded: warns=%v plugins=%v", warns, h.Plugins())
+	}
+	rt.Close()
+
+	// 注入:首装即发现。
+	rt2, _, err := Mount(context.Background(), hf, Sources{Dirs: []string{dir}, ExtraSuffixes: []string{".brand.zip"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+	if !h.HasPlugin("wasm.demo") {
+		t.Fatalf("injected suffix not loaded: plugins=%v", h.Plugins())
+	}
+}
+
+// TestMountFailureFullUnwind 装配失败全清:目录阶段已进册的插件被反注册
+// (Watcher.Unload),宿主回到装配前状态——出站远程缺 StreamDial 即失败。
+func TestMountFailureFullUnwind(t *testing.T) {
+	hf, h := mountHost(t)
+	// 预置一个装配前就在册的插件:全清不得误伤它(只清本次目录装载的)。
+	pre := &prePlug{}
+	if err := h.Register(pre); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeZip(t, dir, "demo.egop.zip", demoManifest, demoModule(t))
+
+	_, _, err := Mount(context.Background(), hf, Sources{
+		Dirs:   []string{dir},
+		Remote: []RemoteSpec{{ID: "remote.demo", Addr: "x"}}, // 无 StreamDial → 失败
+	})
+	if err == nil {
+		t.Fatal("mount without StreamDial must fail")
+	}
+	if h.HasPlugin("wasm.demo") {
+		t.Fatalf("dir-loaded plugin must be unregistered on failure: %v", h.Plugins())
+	}
+	if !h.HasPlugin("pre.existing") {
+		t.Fatal("pre-existing plugin must survive mount failure cleanup")
+	}
+}
+
+// prePlug 是装配前已在册的最小插件(全清边界断言用)。
+type prePlug struct{}
+
+func (prePlug) Meta() contract.Meta {
+	return contract.Meta{ID: "pre.existing", Name: "P", Version: "1"}
+}

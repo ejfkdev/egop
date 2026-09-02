@@ -453,3 +453,89 @@ func TestSelfPublishNoDeadlock(t *testing.T) {
 	// 跨 goroutine 投递仍然可达:插件空闲(锁可得)时 Dispatch 正常命中订阅。
 	bus.Dispatch(context.Background(), contract.Event{Type: "outside.topic", Payload: json.RawMessage(`{"n":1}`)})
 }
+
+// TestStartFunctionsRunBeforeCalls 回归 WithStartFunctions("_initialize","_start"):
+// reactor 形态插件(Go wasip1 -buildmode=c-shared 同款)的 _initialize 必须在宿主
+// 读清单/调函数**之前**由实例化执行——夹具 startfn.wat 的 _initialize 置位标记,
+// egop_call("ready") 回显 1 即证明顺序;同时验证"两者皆无"的手写 WAT 宽容跳过
+// (demo/selfpub 夹具照常装载,见各自测试)。
+func TestStartFunctionsRunBeforeCalls(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("testdata", "startfn.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadFS(context.Background(), b, "startfn.egop.wasm", Options{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer p.Close(context.Background())
+	h := host.New[any](host.Options[any]{})
+	if err := h.Register(p); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	out, err := h.Call(context.Background(), "wasm.startfn", "ready", nil)
+	if err != nil {
+		t.Fatalf("call ready: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("ready = %s, want 1 (_initialize must run at instantiation, before any host call)", out)
+	}
+}
+
+// TestCodelessBundleHostLifecycle 无代码包经宿主全生命周期:注册进册、
+// plugin.registered/removed 生命周期事件照常广播、卸载干净——资源包与代码
+// 插件同一生命周期面(无 guest 代码不影响宿主机制)。
+func TestCodelessBundleHostLifecycle(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, _ := zw.Create("manifest.json")
+	_, _ = w.Write([]byte(`{"id":"pack.life","name":"L","version":"1","extensions":{"demo.k":{"v":1}}}`))
+	w, _ = zw.Create("assets/a.txt")
+	_, _ = w.Write([]byte("asset-a"))
+	_ = zw.Close()
+
+	p, err := LoadFS(context.Background(), buf.Bytes(), "life.egop.zip", Options{})
+	if err != nil {
+		t.Fatalf("load codeless: %v", err)
+	}
+	defer p.Close(context.Background())
+
+	bus := host.NewMemEvents()
+	var mu sync.Mutex
+	seen := map[string]int{}
+	for _, topic := range []string{contract.EventPluginRegistered, contract.EventPluginRemoved} {
+		tp := topic
+		bus.Subscribe(&contract.EventFilter{Type: tp}, func(_ context.Context, e contract.Event) {
+			var payload struct {
+				Plugin string `json:"plugin"`
+			}
+			_ = json.Unmarshal(e.Payload, &payload)
+			if payload.Plugin == "pack.life" {
+				mu.Lock()
+				seen[tp]++
+				mu.Unlock()
+			}
+		})
+	}
+	h := host.New[any](host.Options[any]{Events: bus})
+	if err := h.Register(p); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if !h.HasPlugin("pack.life") {
+		t.Fatal("codeless bundle not registered")
+	}
+	if _, ok := h.Plugins()[0].Extensions["demo.k"]; !ok && len(h.Plugins()) == 1 {
+		t.Fatal("extensions lost in host meta")
+	}
+	if _, err := h.Remove("pack.life", false); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if h.HasPlugin("pack.life") {
+		t.Fatal("still registered after remove")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen[contract.EventPluginRegistered] != 1 || seen[contract.EventPluginRemoved] != 1 {
+		t.Fatalf("lifecycle events = %v, want exactly one registered + one removed", seen)
+	}
+}

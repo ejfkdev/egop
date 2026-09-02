@@ -171,3 +171,42 @@ func TestReplaceValidatesContract(t *testing.T) {
 		t.Fatalf("replace did not take effect: %s", h.meta["A"].Version)
 	}
 }
+
+// TestReplaceReEnsuresDeclarations 热替换的新声明面(点位/hook 点/事件主题)与
+// 首注册一致地补落——替换不只是换实例,声明簿记同样刷新。
+func TestReplaceReEnsuresDeclarations(t *testing.T) {
+	pts := NewMemPoints()
+	ev := NewMemEvents()
+	h := New[any](Options[any]{Points: pts, Events: ev})
+	v1 := &demoPlugin{meta: contract.Meta{ID: "R", Name: "R", Version: "1"}}
+	if err := h.Register(v1); err != nil {
+		t.Fatal(err)
+	}
+	v2 := &demoPlugin{meta: contract.Meta{ID: "R", Name: "R", Version: "2",
+		Provides: contract.Provides{
+			Points: []string{"run.new"},
+			Hooks:  []contract.HookPointSpec{{ID: "h.new", Kind: contract.KindObserve}},
+			Events: []contract.EventTopicSpec{{ID: "e.new"}},
+		},
+		Requires: contract.Requires{Listens: []string{"run.listen"}},
+	}}
+	if err := h.Replace(v2); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range pts.Points() {
+		got[p] = true
+	}
+	for _, want := range []string{"run.new", "run.listen", contract.PointID("R", "h.new")} {
+		if !got[want] {
+			t.Fatalf("point %q not ensured on replace: %v", want, pts.Points())
+		}
+	}
+	topics := map[string]bool{}
+	for _, tp := range ev.Topics() {
+		topics[tp] = true
+	}
+	if !topics[contract.EventID("R", "e.new")] {
+		t.Fatalf("topic dyn.R.e.new not ensured on replace: %v", ev.Topics())
+	}
+}

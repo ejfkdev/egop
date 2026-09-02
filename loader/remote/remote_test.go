@@ -736,3 +736,60 @@ func TestInboundNetOpsGated(t *testing.T) {
 		t.Fatalf("fs_read gate err = %v", err)
 	}
 }
+
+// TestRemoteCrossPluginCallOrigin 跨插件调用打远程插件:调用者 Origin(ID+Kind=call)
+// 经帧字段上线、插件侧还原进处理 ctx——与 wasm 第三参/进程内 ctx 三世界同语义。
+func TestRemoteCrossPluginCallOrigin(t *testing.T) {
+	h, _ := remoteTestHost(t)
+	mf := loadManifest(t, remoteDemoManifest)
+
+	originCh := make(chan string, 1)
+	ops := &PluginOps{
+		CallFunc: func(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+			if o := contract.OriginFrom(ctx); o != nil {
+				originCh <- o.ID + "/" + string(o.Kind)
+			} else {
+				originCh <- "none"
+			}
+			return input, nil
+		},
+	}
+	sess, err := AttachStream(context.Background(), inboundPipe(t, h, ""), mf, ops)
+	if err != nil {
+		t.Fatalf("AttachStream: %v", err)
+	}
+	defer sess.Close()
+	waitFor(t, 2*time.Second, func() bool { return h.HasPlugin("remote.demo") })
+
+	// 进程内调用方插件(plugin.call)经 Surface.Call 打远程插件。
+	caller := &originCallerPlug{}
+	if err := h.Register(caller); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Call(context.Background(), "caller.go", "reach", nil); err != nil {
+		t.Fatalf("Call(reach): %v", err)
+	}
+	select {
+	case got := <-originCh:
+		if got != "caller.go/call" {
+			t.Fatalf("plugin-side origin = %q, want caller.go/call", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remote call did not reach plugin")
+	}
+}
+
+// originCallerPlug 是进程内调用方(经 Surface.Call 注入调用者 Origin)。
+type originCallerPlug struct{ surface contract.Surface }
+
+func (p *originCallerPlug) Meta() contract.Meta {
+	return contract.Meta{ID: "caller.go", Name: "Caller", Version: "1",
+		Provides: contract.Provides{
+			Capabilities: []string{contract.CapCallPlugins},
+			Functions:    []contract.FuncSpec{{Name: "reach"}},
+		}}
+}
+func (p *originCallerPlug) SetSurface(s contract.Surface) { p.surface = s }
+func (p *originCallerPlug) CallFunc(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+	return p.surface.Call(ctx, "remote.demo", "echo", input)
+}

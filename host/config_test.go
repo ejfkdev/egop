@@ -4,6 +4,8 @@ package host
 
 import (
 	"encoding/json"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/ejfkdev/egop/contract"
@@ -58,5 +60,49 @@ func TestSetConfigFieldMerges(t *testing.T) {
 	_ = json.Unmarshal(got, &m)
 	if len(m) != 2 || string(m["a"]) != `1` || string(m["b"]) != `2` {
 		t.Fatalf("applied = %s (want merge, not replace)", got)
+	}
+}
+
+// TestSetConfigFieldConcurrentNoLostUpdate 并发单字段写不丢更新:配置写链路经
+// cfgMu 串行(读旧 applied→合并→下发→记录全程原子),N 个 goroutine 各写各的
+// 字段,最终全部字段都在——修复前"读合写"在锁外,并发会互相覆盖丢字段。
+func TestSetConfigFieldConcurrentNoLostUpdate(t *testing.T) {
+	const n = 32
+	fields := make([]contract.ConfigFieldSpec, 0, n)
+	for i := 0; i < n; i++ {
+		fields = append(fields, contract.ConfigFieldSpec{Key: "k" + strconv.Itoa(i)})
+	}
+	h := New[any](Options[any]{})
+	if err := h.Register(&demoPlugin{meta: contract.Meta{ID: "c", Name: "C", Version: "1",
+		Provides: contract.Provides{Config: fields}}}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := h.SetConfigField("c", "k"+strconv.Itoa(i), json.RawMessage(strconv.Itoa(i))); err != nil {
+				t.Errorf("SetConfigField(k%d): %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	got, ok := h.AppliedConfig("c")
+	if !ok {
+		t.Fatal("no applied config after concurrent writes")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatalf("applied = %s (%v)", got, err)
+	}
+	if len(m) != n {
+		t.Fatalf("applied has %d fields, want %d (lost update): %s", len(m), n, got)
+	}
+	for i := 0; i < n; i++ {
+		if string(m["k"+strconv.Itoa(i)]) != strconv.Itoa(i) {
+			t.Fatalf("field k%d = %s, want %d", i, m["k"+strconv.Itoa(i)], i)
+		}
 	}
 }
