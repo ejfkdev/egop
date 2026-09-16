@@ -200,7 +200,7 @@ func TestHostIntegrationCallAndEvents(t *testing.T) {
 	evt := contract.Event{Type: "wasm.test.topic", Version: contract.EnvelopeVersion, Payload: payload}
 	ev.Dispatch(context.Background(), evt)
 	eventJSON, _ := json.Marshal(evt)
-	mem := p.mod.Memory()
+	mem := p.insts[0].mod.Memory()
 	b, ok := mem.Read(3800, uint32(len(eventJSON)))
 	if !ok || !bytes.Equal(b, eventJSON) {
 		t.Fatalf("event buffer = %q ok=%v (want %s)", b, ok, eventJSON)
@@ -354,12 +354,12 @@ func TestHostMetaAndConfigImports(t *testing.T) {
 
 	readEnv := func(addr uint32) map[string]json.RawMessage {
 		t.Helper()
-		slot, ok := p.mod.Memory().Read(addr, 8)
+		slot, ok := p.insts[0].mod.Memory().Read(addr, 8)
 		if !ok {
 			t.Fatalf("read slot @%d", addr)
 		}
 		ptr, n := unpack(binary.LittleEndian.Uint64(slot))
-		envBytes, ok := p.mod.Memory().Read(ptr, n)
+		envBytes, ok := p.insts[0].mod.Memory().Read(ptr, n)
 		if !ok {
 			t.Fatalf("read envelope @%d len %d", ptr, n)
 		}

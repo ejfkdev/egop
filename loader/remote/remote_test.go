@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -597,6 +598,25 @@ func (fakePipeNet) DialStream(context.Context, string, map[string]string) (contr
 type memFSBackend struct {
 	mu    sync.Mutex
 	files map[string][]byte
+}
+
+func (m *memFSBackend) ReadDir(name string) ([]contract.DirEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prefix := name
+	if prefix == "." || prefix == "/" {
+		prefix = ""
+	} else {
+		prefix = strings.TrimSuffix(prefix, "/") + "/"
+	}
+	var out []contract.DirEntry
+	for k := range m.files {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, contract.DirEntry{Name: strings.TrimPrefix(k, prefix)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func (m *memFSBackend) ReadFile(name string) ([]byte, error) {

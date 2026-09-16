@@ -22,9 +22,10 @@ subscribe / push_event / shutdown / ping`。
 - 回复统一信封：`payload={"ok":true,"result":…}|{"ok":false,"error":…}`，
   `error` 字段只用于传输级/校验失败；
 - **HostCall op 词汇**（插件→框架能力回程，与 wasm 宿主注入同构）：
-  `call / get_setting / persist_read / persist_write / persist_list / kv_get /
+  `call / get_setting / persist_read / persist_write / persist_append / persist_list / kv_get /
   kv_put / kv_delete / kv_keys / exec / on_hook / publish_event / plugins /
-  get_plugin / get_config / set_config`——
+  get_plugin / get_config / set_config / fs_read / fs_readdir / fs_write /
+  net_request / net_body_read / net_body_close`——
   框架侧一律经 `RemoteHost.SurfaceFor(pluginID)` 取能力门控视图，未声明能力 =
   拒绝（与进程内插件同一语义）。其余 op 名经 `Surface.Op` 扩展透传，守卫词由装配
   注入（`host.Options.OpAliases`）。

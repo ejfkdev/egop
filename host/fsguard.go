@@ -24,6 +24,13 @@ func (g fsGuard) ReadFile(name string) ([]byte, error) {
 	return g.next.ReadFile(name)
 }
 
+func (g fsGuard) ReadDir(name string) ([]contract.DirEntry, error) {
+	if !g.canRead {
+		return nil, fmt.Errorf("plugin %s: capability %q not declared", g.pluginID, contract.CapFSRead)
+	}
+	return g.next.ReadDir(name)
+}
+
 func (g fsGuard) WriteFile(name string, data []byte) error {
 	if !g.canWrite {
 		return fmt.Errorf("plugin %s: capability %q not declared", g.pluginID, contract.CapFSWrite)

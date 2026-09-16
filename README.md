@@ -132,11 +132,14 @@ The design follows three cordis mechanisms, mapped onto Go:
   to the `egop_meta` export) and `*.egop.zip` (manifest.json + plugin.wasm + assets/;
   plugin.wasm is optional — a zip without it is a **codeless bundle**: pure manifest/assets,
   e.g. UI plugins); extra zip suffixes (brand conventions) inject via `Options.ExtraSuffixes`;
-  directory discovery via `ScanDir`.
+  directory discovery via `ScanDir`. Runs each plugin on an optional instance pool
+  (`egop.pool` manifest extension) with self-healing revive after interrupted calls and
+  live tool discovery (`egop_tool_specs`); a real guest system clock is always wired.
 - `loader/remote` — transport-agnostic remote channel: egop only sends/receives JSON frames
   on an injected `remote.Stream`; the connection is established externally.
 - `loader` — the unified host face `loader.HostFace`: assembly components depend only on it.
-- `autoload` — hot-reload directory loader: polling + hash + two-phase confirmation.
+- `autoload` — hot-reload directory loader: polling + hash + two-phase confirmation
+  (failed loads keep their watch slot and retry across rounds).
 - `mount` — one-stop assembly: a single `Sources` declaration drives every external seam.
 - `skeleton/{loader,config,registry,trigger}` — mechanism skeletons (reference shapes).
 - `undo` — the unified effect stack.

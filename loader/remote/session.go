@@ -48,6 +48,10 @@ func (UnimplementedPeer) HandleHostCall(context.Context, string, json.RawMessage
 func (UnimplementedPeer) HandleSubscribe(context.Context, *contract.EventFilter) {}
 func (UnimplementedPeer) HandleShutdown(string)                                  {}
 
+// dispatchConcurrency 是单会话入站请求的并发派发上限(防 goroutine 无界;
+// 超额回执 busy 给对端,背压而非阻塞读循环)。
+const dispatchConcurrency = 32
+
 // Session 是单条流的双向复用引擎。
 type Session struct {
 	stream    Stream
@@ -60,6 +64,7 @@ type Session struct {
 	onClosed  func(err error)
 	pushFn    func(ctx context.Context, topic string, e contract.Event) // 插件侧事件投递口(构造期设置)
 	cleanup   func()                                                    // 连接终结的资源清理(构造后设置)
+	dispSem   chan struct{}                                             // 入站请求派发配额(有界并发)
 }
 
 // NewSession 包装一条双向流。
@@ -68,6 +73,7 @@ func NewSession(stream Stream) *Session {
 		stream:  stream,
 		pending: map[uint64]chan *Frame{},
 		done:    make(chan struct{}),
+		dispSem: make(chan struct{}, dispatchConcurrency),
 	}
 }
 
@@ -273,6 +279,41 @@ func (s *Session) replyErr(id uint64, msg string) {
 	_ = s.send(&Frame{Id: id, Reply: true, Error: msg, Payload: errEnvelope(errors.New(msg))})
 }
 
+// dispatchAsync 把入站请求帧派发到带界工作 goroutine:一个慢 op(长调用/挂死
+// 的回调)不再队头阻塞整条会话——后续帧(含其它请求的回复路由、事件推送)
+// 继续处理;同会话自调(插件经宿主回程调回自己)也因此不再死锁:外层处理
+// 等回复期间,嵌套请求帧照常读入派发。配额满即回执 busy(背压给对端,绝不
+// 阻塞读循环)。副作用:入站请求的**处理不再保序**(帧仍按序读入;回复按 id
+// 关联,顺序无依赖)。事件推送(push_event)保持内联派发以保投递顺序。
+func (s *Session) dispatchAsync(ctx context.Context, peer Peer, f *Frame) {
+	if peer == nil {
+		s.replyErr(f.Id, "remote: request before handshake")
+		return
+	}
+	select {
+	case s.dispSem <- struct{}{}:
+	default:
+		s.replyErr(f.Id, "remote: dispatcher busy (too many concurrent requests)")
+		return
+	}
+	fc := *f // 帧拷贝:f 是循环局部变量,下一轮复用
+	go func() {
+		defer func() { <-s.dispSem }()
+		switch fc.Kind {
+		case KindCallFunc:
+			s.dispatchCall(ctx, peer, &fc)
+		case KindTool:
+			s.dispatchTool(ctx, peer, &fc)
+		case KindHook:
+			s.dispatchHook(ctx, peer, &fc)
+		case KindApplyConfig:
+			s.dispatchConfig(ctx, peer, &fc)
+		case KindHostCall:
+			s.dispatchHostCall(ctx, peer, &fc)
+		}
+	}()
+}
+
 // recvLoop 是流的唯一读侧:回复路由回 pending,请求/单向帧按 kind 分发 peer。
 func (s *Session) recvLoop() {
 	var loopErr error
@@ -300,16 +341,8 @@ func (s *Session) recvLoop() {
 			}
 		case f.Id != 0:
 			switch f.Kind {
-			case KindCallFunc:
-				s.dispatchCall(ctx, peer, &f)
-			case KindTool:
-				s.dispatchTool(ctx, peer, &f)
-			case KindHook:
-				s.dispatchHook(ctx, peer, &f)
-			case KindApplyConfig:
-				s.dispatchConfig(ctx, peer, &f)
-			case KindHostCall:
-				s.dispatchHostCall(ctx, peer, &f)
+			case KindCallFunc, KindTool, KindHook, KindApplyConfig, KindHostCall:
+				s.dispatchAsync(ctx, peer, &f)
 			case KindSubscribe:
 				if peer == nil {
 					s.replyErr(f.Id, "remote: subscribe before handshake")

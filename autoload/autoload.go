@@ -71,6 +71,11 @@ type unit struct {
 	plugin  *wasm.Plugin
 	loaded  bool
 	read    func() ([]byte, error) // 读取当前内容(os 目录或注入 FS)
+
+	// 失败重试分层(与决策 #25 配套):
+	np      *wasm.Plugin // 装载成功、注册未成(依赖未就位)的实例——只重试 Register,不重编译
+	npHash  string       // np 对应内容 hash(变化即作废重装)
+	errHash string       // 内容坏件的 hash——未变化不重试(重试=每轮全量重编译)
 }
 
 // Watcher 监视一组插件目录并把变更应用到宿主。
@@ -154,6 +159,9 @@ func (w *Watcher) Unload(ctx context.Context) {
 	defer w.mu.Unlock()
 	for p, u := range w.units {
 		if !u.loaded {
+			if u.np != nil {
+				_ = u.np.Close(ctx) // 待补载实例(依赖未就位)一并清退
+			}
 			delete(w.units, p)
 			continue
 		}
@@ -243,6 +251,9 @@ func (w *Watcher) pollOnceLocked(ctx context.Context) []Event {
 		if u.loaded && h == u.hash {
 			continue // 无变化
 		}
+		if u.np == nil && u.errHash == h {
+			continue // 内容坏且未变:不重试(等 hash 变化;每轮重编译是纯 CPU 烧)
+		}
 		if u.pending != h {
 			u.pending = h // 首轮观察:确认为稳定内容
 			continue
@@ -254,8 +265,29 @@ func (w *Watcher) pollOnceLocked(ctx context.Context) []Event {
 	return events
 }
 
-// applyChange 装载新内容和应用(入册/替换);回退语义见包注释。
+// applyChange 装载新内容和应用(入册/替换);回退语义见包注释。失败重试分层:
+//   - 内容坏(LoadFS 失败/契约拒载):记 errHash——hash 未变不重试(重试=每轮
+//     全量重编译,纯 CPU 烧);内容变化后重新两段确认再试。
+//   - 注册瞬态失败(依赖未就位):保留已装载实例 np——后续轮次**只重试
+//     Register**(依赖链乱序时先失败件跨轮补载;不再重编译)。
 func (w *Watcher) applyChange(ctx context.Context, u *unit, h, p string, _ bool) Event {
+	// 已有"装载成功、注册未成"的实例:依赖可能已到位——只重试 Register。
+	if u.np != nil {
+		if h != u.npHash {
+			// 内容已变:旧 np 作废,走下方完整装载。
+			_ = u.np.Close(ctx)
+			u.np, u.npHash = nil, ""
+		} else if err := w.hf.Register(u.np); err == nil {
+			meta := u.np.Meta()
+			u.id, u.hash, u.loaded, u.plugin = meta.ID, h, true, u.np
+			u.np, u.npHash = nil, ""
+			w.logf("autoload: plugin %s registered (%s)", meta.ID, p)
+			return Event{Action: ActionRegister, PluginID: meta.ID, Path: p, Version: meta.Version}
+		} else {
+			// 依赖仍未就位:继续保留 np,下一轮再试 Register。
+			return Event{Action: ActionFailed, PluginID: u.np.Meta().ID, Path: p, Err: err}
+		}
+	}
 	data, err := u.read()
 	if err != nil {
 		u.pending = ""
@@ -263,19 +295,18 @@ func (w *Watcher) applyChange(ctx context.Context, u *unit, h, p string, _ bool)
 	}
 	np, err := wasm.LoadFS(ctx, data, filepath.Base(p), wasm.Options{ExtraSuffixes: w.opts.ExtraSuffixes})
 	if err != nil {
+		u.pending = ""
 		if !u.loaded {
-			delete(w.units, p) // 从未入册的坏包:不留观察槽,待下次变化再试
-		} else {
-			u.pending = "" // 旧版在册:清候选,等待真变化
+			u.errHash = h // 从未入册的内容坏件:等 hash 变化再试
 		}
-		// 装载失败一律 ActionFailed(含"旧版在册的坏替换"),区别于真正替换成功的 ActionReplace。
+		// 装载失败一律 ActionFailed(含"旧版在册的坏替换"——旧版继续服务)。
 		return Event{Action: ActionFailed, PluginID: u.id, Path: p, Err: err}
 	}
 	meta := np.Meta()
 	if !u.loaded {
 		if err := w.hf.Register(np); err != nil {
-			_ = np.Close(ctx)
-			delete(w.units, p)
+			// 依赖未就位等瞬态失败:保留已装载实例,下一轮只重试 Register。
+			u.np, u.npHash = np, h
 			return Event{Action: ActionFailed, PluginID: meta.ID, Path: p, Err: err}
 		}
 		u.id, u.hash, u.loaded, u.plugin = meta.ID, h, true, np
@@ -288,6 +319,7 @@ func (w *Watcher) applyChange(ctx context.Context, u *unit, h, p string, _ bool)
 		if err := w.hf.Register(np); err != nil {
 			_ = np.Close(ctx)
 			u.pending = ""
+			u.errHash = h
 			ev.Action = ActionFailed
 			ev.Err = fmt.Errorf("new manifest id %q: %w", meta.ID, err)
 			return ev
@@ -307,6 +339,7 @@ func (w *Watcher) applyChange(ctx context.Context, u *unit, h, p string, _ bool)
 	if err := w.hf.Replace(np); err != nil {
 		_ = np.Close(ctx)
 		u.pending = ""
+		u.errHash = h // 坏替换件:等 hash 变化再试,旧版继续服务
 		return Event{Action: ActionFailed, PluginID: u.id, Path: p, Err: fmt.Errorf("replace refused, old version kept: %w", err)}
 	}
 	_ = old.Close(ctx)

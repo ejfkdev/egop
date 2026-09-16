@@ -150,6 +150,10 @@ surface.SubscribeEventFilter(nil, func(ctx context.Context, topic string, e cont
 `Type`(=主题,**必填**,空则丢弃)/`SubType`/`Labels`(自由键值)/`Payload`,框架回填
 `Version` 与 `Source`(来源即 `contract.Origin`,与 hook/调用的来源同构)。
 
+**框架保留主题**:`plugin.*` 生命周期事件与 `plugin.config.updated` 是宿主专署——
+插件发布这些主题会被拒发并留痕(宿主侧 `contract.IsFrameworkTopic` 判定),防伪造
+生命周期事件。
+
 订阅按 `contract.EventFilter` 匹配（`nil`/零值 = 全部；字段间 AND，可只设一个或多个）：
 
 | 字段 | 语义 |
@@ -240,7 +244,10 @@ for e := range rt.Events() { /* register / replace / remove / failed */ }
 抗目录瞬态读失败误卸）、替换失败回退保旧版（`Replace` 与 `Register` 同款契约校验，
 拒换即旧版继续服务）、替换成功重放配置、坏包隔离、删除被依赖者 fail-closed
 （点名与槽位依赖同判）；`mount` 首装"拍至稳定"补全乱序依赖链，装配失败时句柄
-自行**全清**（含反注册目录阶段已进册的插件）。
+自行**全清**（含反注册目录阶段已进册的插件）。**失败重试分层**：内容坏件
+（装载失败/契约拒载）hash 未变不重试（等真变化再重新两段确认）；注册瞬态失败
+（依赖未就位）保留已装载实例、下轮只重试 Register——依赖后落地时先失败件自动
+补载且不重新编译。
 
 ## 10. ctx 能力面（Surface）对照
 
@@ -252,11 +259,11 @@ for e := range rt.Events() { /* register / replace / remove / failed */ }
 | `config.write` | `SetConfig` | 报错 |
 | `event.emit` | `PublishEvent` / `Publish` | no-op |
 | `event.listen` | `SubscribeEvent` / `SubscribeEventFilter` | no-op（空撤销函数） |
-| `storage.persist` | `Persist` | 返回 `(nil,false)` |
+| `storage.persist` | `Persist`（Read/Write/Append/List；`Write` 整文件覆盖、`Append` 末尾追加——append-only 日志/事实账用 Append，拿 Write 追加会截断） | 返回 `(nil,false)` |
 | `storage.kv` | `KV` | 返回 `(nil,false)` |
 | `exec.cmd` | `Exec` | 报错 |
 | `net.access` | `Net`（Request / DialStream，协议门：拒绝 `file://` 等非网络 scheme） | 返回 `(nil,false)` |
-| `fs.read` | `FS().ReadFile`（全局文件系统受控视图，范围/沙箱由注入实现决定） | `FS()` 返回 `(nil,false)`；只声明 write 时 ReadFile 报错 |
+| `fs.read` | `FS().ReadFile` / `FS().ReadDir`（全局文件系统受控视图，范围/沙箱由注入实现决定） | `FS()` 返回 `(nil,false)`；只声明 write 时读与列目录报错 |
 | `fs.write` | `FS().WriteFile` | 同上（分向门控） |
 | 扩展能力（装配注入） | `Op(ctx,name,input)` | 经 `OpAliases` 映射守卫词后判定 |
 

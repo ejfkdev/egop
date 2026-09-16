@@ -123,13 +123,16 @@ defer rt.Close()
 - `loader/wasm`——`*.egop.wasm`（自定义段 `egop.manifest` 内嵌清单,缺省回退
   `egop_meta` 导出）与 `*.egop.zip`（manifest.json+plugin.wasm+assets/;plugin.wasm
   可缺省——无代码插件:纯清单/资产,如 UI 插件）加载;品牌 zip 后缀经
-  `Options.ExtraSuffixes` 装配注入;目录递归发现 `ScanDir`。
+  `Options.ExtraSuffixes` 装配注入;目录递归发现 `ScanDir`。运行面:可选实例池
+  （清单扩展 `egop.pool`）、调用打断自愈（revive）、活体工具面
+  （`egop_tool_specs`）、guest 真系统时钟恒接。
 - `loader/remote`——远程通道(传输无关):egop 只在注入的 `remote.Stream` 上收发 JSON
   帧,连接由外部建立;框架主动拨插件 / 插件主动拨框架同帧表,注册流双工复用。
 - `loader`——统一宿主面 `loader.HostFace`:装配组件(autoload/mount/remote)
   只依赖它,`host.Host[C]` 天然满足,非 core 宿主包一层桥即接入全部加载器。
 - `autoload`——**热更目录装载器**:轮询+hash 判变+两段确认,增/改/删映射为
-  注册/热替换/卸载;替换失败回退保旧版;替换成功重放已下发配置。
+  注册/热替换/卸载;替换失败回退保旧版;替换成功重放已下发配置;失败件保留
+  观察槽跨轮重试(依赖链乱序时先失败件自动补载)。
 - `mount`——**一站式装配**:一份 `Sources` 声明(插件目录[可选热更]+
   远程出站 + 入站 accept,传输经注入)同时驱动全部外接面,业务仓零加载循环。
 - `skeleton/{loader,config,registry,trigger}`——机制骨架(装配参考实现)。

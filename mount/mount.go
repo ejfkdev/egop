@@ -61,6 +61,7 @@ type Runtime struct {
 	failed   bool            // 装配失败标记:Close 走全清(含目录插件反注册)
 	watcher  *autoload.Watcher
 	cancel   context.CancelFunc // 停止注入的入站 accept 循环
+	wg       sync.WaitGroup     // accept 循环 + 各 ServeStream goroutine(Close join,不留迟到注册窗口)
 }
 
 // Mount 按来源装配:目录三连拍两段确认装载、出站拨号、入站 accept;Watch 时
@@ -90,7 +91,9 @@ func Mount(ctx context.Context, hf loader.HostFace, src Sources) (*Runtime, []er
 		if i >= 3 {
 			progressed := false
 			for _, e := range evs {
-				if e.Action == autoload.ActionRegister || e.Action == autoload.ActionReplace {
+				// Failed 也算进展:失败件保留观察槽跨轮重试(依赖链补载中),
+				// 若在此停轮会把重试中的插件永久落下(2026-09-10 zip-only 实锤)。
+				if e.Action == autoload.ActionRegister || e.Action == autoload.ActionReplace || e.Action == autoload.ActionFailed {
 					progressed = true
 					break
 				}
@@ -158,7 +161,9 @@ func Mount(ctx context.Context, hf loader.HostFace, src Sources) (*Runtime, []er
 	if src.StreamAccept != nil {
 		acceptCtx, cancel := context.WithCancel(ctx)
 		rt.cancel = cancel
+		rt.wg.Add(1)
 		go func() {
+			defer rt.wg.Done()
 			for {
 				stream, err := src.StreamAccept(acceptCtx)
 				if err != nil {
@@ -167,7 +172,11 @@ func Mount(ctx context.Context, hf loader.HostFace, src Sources) (*Runtime, []er
 				rt.mu.Lock()
 				rt.inbound = append(rt.inbound, stream)
 				rt.mu.Unlock()
+				// 入站会话 goroutine 计入 wg:accept 自身计数在手,Add 不与
+				// Wait 的零计数竞速;Close 释锁后再 join(它们要取 rt.mu)。
+				rt.wg.Add(1)
 				go func() {
+					defer rt.wg.Done()
 					_ = remote.ServeStream(acceptCtx, hf, stream, "", func(f string, a ...any) {
 						rt.logf("remote: "+f, a...)
 					})
@@ -204,7 +213,6 @@ func (rt *Runtime) Events() <-chan autoload.Event {
 // 此步——注册面归宿主,由宿主总闸(Host.Close)统一清退。
 func (rt *Runtime) Close() {
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
 	if rt.watcher != nil {
 		rt.watcher.Stop()
 		if rt.failed {
@@ -227,4 +235,8 @@ func (rt *Runtime) Close() {
 		_ = stream.Close()
 	}
 	rt.inbound = nil
+	rt.mu.Unlock()
+	// join accept/ServeStream goroutine(先关流/取消,它们随即退出;join 在
+	// 释锁后——它们收尾要取 rt.mu)。关停不留"迟到注册"窗口。
+	rt.wg.Wait()
 }

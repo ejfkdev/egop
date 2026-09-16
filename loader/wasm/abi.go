@@ -41,6 +41,10 @@ const (
 	ExportCall = "egop_call"
 	// ExportTool 工具调用(Manifest.Tools 的来源;tctx = 线上 JSON)。
 	ExportTool = "egop_tool"
+	// ExportToolSpecs 活体工具面查询(可选导出;动态工具插件如 MCP 客户端的
+	// 运行期发现真源)。缺省/失败=回落线上清单静态 Tools(向后兼容:旧 guest
+	// 无此导出照常工作)。
+	ExportToolSpecs = "egop_tool_specs"
 	// ExportApplyConfig 配置下发(SetConfig)。
 	ExportApplyConfig = "egop_apply_config"
 	// ExportGetConfig 读回当前生效配置(ConfigProvider.Config;返回裸 JSON (ptr,len),
@@ -65,8 +69,11 @@ const (
 	ImportGetSetting = "get_setting"
 	// ImportPersistRead Surface.Persist:读文件(结果信封 result_b64)。
 	ImportPersistRead = "persist_read"
-	// ImportPersistWrite Surface.Persist:写文件。
+	// ImportPersistWrite Surface.Persist:写文件(整文件覆盖语义)。
 	ImportPersistWrite = "persist_write"
+	// ImportPersistAppend Surface.Persist:末尾追加(append-only 日志真源;
+	// 拿 persist_write 追加=每次截断只留末行)。
+	ImportPersistAppend = "persist_append"
 	// ImportPersistList Surface.Persist:列文件。
 	ImportPersistList = "persist_list"
 	// ImportKVGet Surface.KV:取值。
@@ -92,6 +99,13 @@ const (
 	ImportReadAsset = "read_asset"
 	// ImportFSRead Surface.FS:读全局文件系统(需 fs.read;结果走 result_b64)。
 	ImportFSRead = "fs_read"
+	// MaxFSReadBytes 是 fs_read 单次回传 guest 的数据上限(8MiB):base64 信封
+	// 放大 4/3 + guest 解析复制,8MiB 数据在 64MiB 线性内存里安全;超限=宿主侧
+	// 报错(工具语义层各自再收紧,如 fsp grep 256KB)。
+	MaxFSReadBytes = 8 << 20
+
+	// ImportFSReadDir Surface.FS:列举目录一层(需 fs.read;结果=JSON 数组 [{name,is_dir,size?,mod_time?}])。
+	ImportFSReadDir = "fs_readdir"
 	// ImportFSWrite Surface.FS:写全局文件系统(需 fs.write;入参 (name,data) 字符串对)。
 	ImportFSWrite = "fs_write"
 	// ImportLog 日志直出:经 Options.LogFn 接入宿主日志面(nil = 静默)。
@@ -200,56 +214,56 @@ type hostOp struct {
 // 能力门控由 Surface 视图承担(plugSurface 语义:未声明能力拿到 no-op 或错误,与进程内插件一致)。
 var hostOps = []hostOp{
 	{name: ImportCall, pairs: 3, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		out, err := p.surface.Call(ctx, args[0], args[1], json.RawMessage(args[2]))
+		out, err := p.surf().Call(ctx, args[0], args[1], json.RawMessage(args[2]))
 		if err != nil {
 			return errRes(err)
 		}
 		return okRes(out)
 	}},
 	{name: ImportPlugins, pairs: 0, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		return okRes(mustJSON(p.surface.Plugins()))
+		return okRes(mustJSON(p.surf().Plugins()))
 	}},
 	{name: ImportGetPlugin, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		meta, found := p.surface.GetPlugin(args[0])
+		meta, found := p.surf().GetPlugin(args[0])
 		return okRes(mustJSON(map[string]any{"found": found, "meta": meta}))
 	}},
 	{name: ImportGetConfig, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		v, found := p.surface.GetConfig(args[0], args[1])
+		v, found := p.surf().GetConfig(args[0], args[1])
 		return okRes(mustJSON(map[string]any{"found": found, "value": v}))
 	}},
 	{name: ImportSetConfig, pairs: 3, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		if err := p.surface.SetConfig(args[0], args[1], json.RawMessage(args[2])); err != nil {
+		if err := p.surf().SetConfig(args[0], args[1], json.RawMessage(args[2])); err != nil {
 			return errRes(err)
 		}
 		return okRes(nil)
 	}},
 	{name: ImportGetSetting, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		v, ok := p.surface.GetSetting(args[0])
+		v, ok := p.surf().GetSetting(args[0])
 		return okRes(mustJSON(map[string]any{"found": ok, "value": v}))
 	}},
 	{name: ImportPersistRead, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		fs, ok := p.surface.Persist()
+		fs, ok := p.surf().Persist()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapPersist))
 		}
@@ -260,10 +274,10 @@ var hostOps = []hostOp{
 		return b64Res(data)
 	}},
 	{name: ImportPersistWrite, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		fs, ok := p.surface.Persist()
+		fs, ok := p.surf().Persist()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapPersist))
 		}
@@ -272,11 +286,24 @@ var hostOps = []hostOp{
 		}
 		return okRes(nil)
 	}},
-	{name: ImportPersistList, pairs: 0, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+	{name: ImportPersistAppend, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		fs, ok := p.surface.Persist()
+		fs, ok := p.surf().Persist()
+		if !ok {
+			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapPersist))
+		}
+		if err := fs.Append(args[0], []byte(args[1])); err != nil {
+			return errRes(err)
+		}
+		return okRes(nil)
+	}},
+	{name: ImportPersistList, pairs: 0, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surf() == nil {
+			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
+		}
+		fs, ok := p.surf().Persist()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapPersist))
 		}
@@ -287,10 +314,10 @@ var hostOps = []hostOp{
 		return okRes(mustJSON(names))
 	}},
 	{name: ImportKVGet, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		kv, ok := p.surface.KV()
+		kv, ok := p.surf().KV()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapKV))
 		}
@@ -301,10 +328,10 @@ var hostOps = []hostOp{
 		return okRes(mustJSON(map[string]any{"found": true, "value_b64": base64.StdEncoding.EncodeToString(v)}))
 	}},
 	{name: ImportKVPut, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		kv, ok := p.surface.KV()
+		kv, ok := p.surf().KV()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapKV))
 		}
@@ -312,10 +339,10 @@ var hostOps = []hostOp{
 		return okRes(nil)
 	}},
 	{name: ImportKVDelete, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		kv, ok := p.surface.KV()
+		kv, ok := p.surf().KV()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapKV))
 		}
@@ -323,38 +350,38 @@ var hostOps = []hostOp{
 		return okRes(nil)
 	}},
 	{name: ImportKVKeys, pairs: 0, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		kv, ok := p.surface.KV()
+		kv, ok := p.surf().KV()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapKV))
 		}
 		return okRes(mustJSON(kv.Keys()))
 	}},
 	{name: ImportExec, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		out, err := p.surface.Exec(ctx, args[0])
+		out, err := p.surf().Exec(ctx, args[0])
 		if err != nil {
 			return errRes(err)
 		}
 		return okRes(mustJSON(map[string]any{"output": out}))
 	}},
 	{name: ImportOp, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
 		// 扩展能力走 Op 面:op 名 + 入参,守卫词与处理器由装配注入。
-		out, err := p.surface.Op(ctx, args[0], json.RawMessage(args[1]))
+		out, err := p.surf().Op(ctx, args[0], json.RawMessage(args[1]))
 		if err != nil {
 			return errRes(err)
 		}
 		return okRes(out)
 	}},
 	{name: ImportPublishEvent, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
 		// 统一事件结构:入参是完整 contract.Event JSON(Type/SubType/Labels/Payload;Source 由框架回填)。
@@ -362,26 +389,42 @@ var hostOps = []hostOp{
 		if err := json.Unmarshal([]byte(args[0]), &ev); err != nil {
 			return errRes(fmt.Errorf("bad event: %w", err))
 		}
-		p.surface.Publish(ctx, ev)
+		p.surf().Publish(ctx, ev)
 		return okRes(nil)
 	}},
 	{name: ImportSubscribeEvent, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
 		// 统一过滤:入参是完整 contract.EventFilter JSON(与远程通道/进程内同构)。
+		// 订阅钉主实例:池>1 时次实例的订阅按无操作忽略(观察面语义不随池放大)。
 		var f contract.EventFilter
 		if err := json.Unmarshal([]byte(args[0]), &f); err != nil {
 			return errRes(fmt.Errorf("bad event filter: %w", err))
 		}
-		p.recordUnsub(p.surface.SubscribeEventFilter(&f, p.pushEvent))
+		if p.registerOnPrimary(m) {
+			if i := p.instForModule(m); i != nil {
+				i.unsubs.Defer(p.surf().SubscribeEventFilter(&f, p.pushEvent))
+			}
+		} else if p.logFn != nil {
+			p.logFn("warn", "wasm plugin "+p.name+": subscribe from secondary instance ignored (observation plane pinned to primary)")
+		}
 		return okRes(nil)
 	}},
 	{name: ImportOnHook, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		p.surface.OnHook(args[0], p.invokeHook)
+		// hook 注册钉主实例,且撤销记进主实例 unsubs——revive 重放 init 时先撤销
+		// 旧注册再重挂,不随复活次数累积(订阅侧同理)。
+		unsub := p.surf().OnHook(args[0], p.invokeHook)
+		if p.registerOnPrimary(m) {
+			if i := p.instForModule(m); i != nil {
+				i.unsubs.Defer(unsub)
+			}
+		} else if p.logFn != nil {
+			p.logFn("warn", "wasm plugin "+p.name+": on_hook from secondary instance ignored (observation plane pinned to primary)")
+		}
 		return okRes(nil)
 	}},
 	{name: ImportReadAsset, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
@@ -392,10 +435,10 @@ var hostOps = []hostOp{
 		return b64Res(data)
 	}},
 	{name: ImportFSRead, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		fsys, ok := p.surface.FS()
+		fsys, ok := p.surf().FS()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapFSRead))
 		}
@@ -403,13 +446,34 @@ var hostOps = []hostOp{
 		if err != nil {
 			return errRes(err)
 		}
+		// ABI 级尺寸护栏:base64 信封会把数据放大 4/3 倍灌进 guest 线性内存
+		// (上限 64MiB),巨文件在宿主侧拒读才是单点防线——guest 侧任何预筛都
+		// 防不住 symlink(Lstat 尺寸小、ReadFile 跟随链接读到巨目标;2026-09-10
+		// grep /tmp 撞 34MB 固件 ftab.bin OOM trap 实锤)。
+		if len(data) > MaxFSReadBytes {
+			return errRes(fmt.Errorf("fs read %s: %d bytes exceeds ABI guard %d (guest memory protection)", args[0], len(data), MaxFSReadBytes))
+		}
 		return b64Res(data)
 	}},
-	{name: ImportFSWrite, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+	{name: ImportFSReadDir, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		fsys, ok := p.surface.FS()
+		fsys, ok := p.surf().FS()
+		if !ok {
+			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapFSRead))
+		}
+		entries, err := fsys.ReadDir(args[0])
+		if err != nil {
+			return errRes(err)
+		}
+		return okRes(mustJSON(entries))
+	}},
+	{name: ImportFSWrite, pairs: 2, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
+		if p.surf() == nil {
+			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
+		}
+		fsys, ok := p.surf().FS()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapFSWrite))
 		}
@@ -425,10 +489,10 @@ var hostOps = []hostOp{
 		return okRes(nil)
 	}},
 	{name: ImportNetRequest, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if p.surface == nil {
+		if p.surf() == nil {
 			return errRes(fmt.Errorf("plugin %s: surface not wired", p.name))
 		}
-		net, ok := p.surface.Net()
+		net, ok := p.surf().Net()
 		if !ok {
 			return errRes(fmt.Errorf("plugin %s: capability %q not available", p.name, contract.CapNet))
 		}
@@ -457,11 +521,15 @@ var hostOps = []hostOp{
 			"status":      resp.Status,
 			"headers":     resp.Headers,
 			"trailers":    resp.Trailers,
-			"body_handle": p.netAlloc(resp.Body),
+			"body_handle": p.instForModule(m).netAlloc(resp.Body),
 		}))
 	}},
 	{name: ImportNetBodyRead, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		if body := p.netGet(args[0]); body != nil {
+		var body io.Reader
+		if i := p.instForModule(m); i != nil {
+			body = i.netGet(args[0])
+		}
+		if body != nil {
 			buf := make([]byte, 32*1024)
 			n, err := body.Read(buf)
 			if n > 0 {
@@ -480,7 +548,9 @@ var hostOps = []hostOp{
 		return okRes(mustJSON(map[string]any{"eof": true}))
 	}},
 	{name: ImportNetBodyClose, pairs: 1, run: func(ctx context.Context, m api.Module, p *Plugin, args []string) hostOpResult {
-		p.netClose(args[0])
+		if i := p.instForModule(m); i != nil {
+			i.netClose(args[0])
+		}
 		return okRes(nil)
 	}},
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/ejfkdev/egop/contract"
 	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
 	wasi_snapshot_preview1 "github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
@@ -101,7 +102,7 @@ func LoadFS(ctx context.Context, data []byte, name string, opts Options) (*Plugi
 			}
 			return p, nil
 		}
-		if err := p.instantiate(ctx, wasmBytes, opts); err != nil {
+		if err := p.instantiate(ctx, wasmBytes, opts, p.poolSize()); err != nil {
 			return nil, err
 		}
 		if err := p.validate(); err != nil {
@@ -121,7 +122,7 @@ func LoadFS(ctx context.Context, data []byte, name string, opts Options) (*Plugi
 	if found {
 		p.manifest = mf
 	}
-	if err := p.instantiate(ctx, data, opts); err != nil {
+	if err := p.instantiate(ctx, data, opts, 1); err != nil {
 		return nil, err
 	}
 	if !found {
@@ -139,11 +140,21 @@ func LoadFS(ctx context.Context, data []byte, name string, opts Options) (*Plugi
 		_ = p.Close(ctx)
 		return nil, err
 	}
+	// 裸 wasm 的清单(自定义段或 egop_meta)此刻已知:按 egop.pool 补池,
+	// 与 zip 形态同语义(装载期实例化只建了 1 个)。
+	if err := p.growPool(ctx, p.poolSize()); err != nil {
+		_ = p.Close(ctx)
+		return nil, err
+	}
 	return p, nil
 }
 
-// instantiate 建立 runtime(含 WASI 无 fs、宿主注入函数表)并编译/实例化 guest。
-func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options) error {
+// instantiate 建立 runtime(含 WASI 无 fs、宿主注入函数表)、编译 guest(compiled
+// 保留作池化/revive 锚)并按池大小实例化。
+func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options, pool int) error {
+	// revive 锚:留住代码字节与装载选项(意外打断后按原样重建;显式 Close 不适用)。
+	p.wasmRaw = append([]byte(nil), wasmBytes...)
+	p.loadOpts = opts
 	lim := opts.MaxMemoryPages
 	if lim == 0 {
 		lim = DefaultMaxPages
@@ -155,14 +166,14 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 
 	// 失败路径统一回收:runtime(goroutine/mmapped 内存)与可能已编译的模块在返回
 	// error 时一并关闭,避免每个坏包在 autoload/mount 轮询里泄漏一个 runtime。
-	var compiled wazero.CompiledModule
 	success := false
 	defer func() {
 		if success {
 			return
 		}
-		if compiled != nil {
-			_ = compiled.Close(ctx)
+		if p.compiled != nil {
+			_ = p.compiled.Close(ctx)
+			p.compiled = nil
 		}
 		_ = r.Close(ctx)
 	}()
@@ -177,6 +188,7 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 	if err != nil {
 		return fmt.Errorf("wasm plugin %s: compile: %w", p.name, err)
 	}
+	p.compiled = compiled
 	for _, def := range compiled.ImportedFunctions() {
 		modName, fName, _ := def.Import()
 		if modName != HostModuleName && modName != WASIModule {
@@ -187,19 +199,40 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 			return fmt.Errorf("wasm plugin %s: unknown host import %q.%q", p.name, modName, fName)
 		}
 	}
-	// Go wasip1 插件用 reactor 模式(-buildmode=c-shared)导出 _initialize、command 模式
-	// 导出 _start,WAT 手写插件可能两者皆无。wazero 对列表里不存在的 start 函数是宽容
-	// 跳过的,故直接按"reactor 优先、command 兜底"列出——保证 Go 插件的 init/运行时在
-	// egop_meta 之前被初始化(否则 Go 插件拿不到注册实例)。
-	cfg := wazero.NewModuleConfig().WithName(p.name).WithStartFunctions("_initialize", "_start")
-	mod, err := r.InstantiateModule(ctx, compiled, cfg)
-	if err != nil {
-		return fmt.Errorf("wasm plugin %s: instantiate: %w", p.name, err)
+	if pool < 1 {
+		pool = 1
 	}
-	_ = compiled.Close(ctx)
-	p.mod = mod
+	for idx := 0; idx < pool; idx++ {
+		i := newInst(fmt.Sprintf("%s#%d", p.name, idx))
+		mod, err := p.instantiateOne(ctx, compiled, i.name)
+		if err != nil {
+			return err
+		}
+		i.mod = mod
+		p.insts = append(p.insts, i)
+		p.byName[i.name] = i
+	}
 	success = true
 	return nil
+}
+
+// instantiateOne 从保留的 compiled 再实例化一个 module(池增补/revive 共用)。
+// Go wasip1 插件用 reactor 模式(-buildmode=c-shared)导出 _initialize、command 模式
+// 导出 _start,WAT 手写插件可能两者皆无。wazero 对列表里不存在的 start 函数是宽容
+// 跳过的,故直接按"reactor 优先、command 兜底"列出——保证 Go 插件的 init/运行时在
+// egop_meta 之前被初始化(否则 Go 插件拿不到注册实例)。
+// 系统时钟三件必接:wazero ModuleConfig 缺省 Walltime/Nanotime 是不可用桩
+// (纪元 2022 假钟/ENOSYS),guest 内 time.Now/Since/Sleep 全部拿到假时间或
+// 报错——TTL/排程/退避类插件逻辑静默错乱(testdata/clock.wat 夹具固化,防回退)。
+func (p *Plugin) instantiateOne(ctx context.Context, compiled wazero.CompiledModule, modName string) (api.Module, error) {
+	cfg := wazero.NewModuleConfig().WithName(modName).
+		WithSysWalltime().WithSysNanotime().WithSysNanosleep().
+		WithStartFunctions("_initialize", "_start")
+	mod, err := p.runtime.InstantiateModule(ctx, compiled, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("wasm plugin %s: instantiate %s: %w", p.name, modName, err)
+	}
+	return mod, nil
 }
 
 // validate 校验 ABI 结构性前提(清单之外的部分)。
@@ -207,22 +240,23 @@ func (p *Plugin) validate() error {
 	if p.manifest.ID == "" {
 		return fmt.Errorf("wasm plugin %s: manifest id required", p.name)
 	}
-	if p.mod.Memory() == nil {
+	m := p.insts[0].mod
+	if m.Memory() == nil {
 		return fmt.Errorf("wasm plugin %s: memory not exported (ABI requires (memory (export \"memory\")))", p.name)
 	}
-	if p.mod.ExportedFunction(ExportHostAlloc) == nil {
+	if m.ExportedFunction(ExportHostAlloc) == nil {
 		return fmt.Errorf("wasm plugin %s: export %q missing (ABI required)", p.name, ExportHostAlloc)
 	}
-	if len(p.manifest.Provides.Functions) > 0 && p.mod.ExportedFunction(ExportCall) == nil {
+	if len(p.manifest.Provides.Functions) > 0 && m.ExportedFunction(ExportCall) == nil {
 		return fmt.Errorf("wasm plugin %s: declares functions but export %q missing", p.name, ExportCall)
 	}
-	if len(p.manifest.Tools) > 0 && p.mod.ExportedFunction(ExportTool) == nil {
+	if len(p.manifest.Tools) > 0 && m.ExportedFunction(ExportTool) == nil {
 		return fmt.Errorf("wasm plugin %s: declares tools but export %q missing", p.name, ExportTool)
 	}
 	// 双形状导出按精确元数校验(4=旧版两参对 / 6=新版含 Origin 第三参对;
 	// 调用侧按 ==6 决定是否传 Origin,其它元数无法兑现任何一种 ABI,装载期即拒)。
 	for _, name := range []string{ExportCall, ExportOnHook} {
-		if fn := p.mod.ExportedFunction(name); fn != nil {
+		if fn := m.ExportedFunction(name); fn != nil {
 			if n := len(fn.Definition().ParamTypes()); n != 4 && n != 6 {
 				return fmt.Errorf("wasm plugin %s: export %q has %d params (ABI wants 4 or 6 i32)", p.name, name, n)
 			}

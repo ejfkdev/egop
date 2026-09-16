@@ -6,90 +6,72 @@ package wasm
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ejfkdev/egop/contract"
-	"github.com/ejfkdev/egop/undo"
 	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
 )
 
-// Plugin 是 WASM 插件的宿主侧实体。guest 实例非并发安全,全部跨边界入口
-// (函数/工具/配置/关闭)经 mu 串行化;宿主注入函数在同一把锁内执行,不可重入取锁。
-// 事件/hook 回调例外:它们可能在 guest 调用持锁期间被同步扇出重入(插件发布命中
-// 自身订阅的事件),故经 TryLock 探测——锁忙即归一为"未送达"(事件丢弃/hook 记
-// Reason),绝不阻塞重入,否则同 goroutine 对非重入锁二次上锁即死锁。
 type Plugin struct {
 	name     string // 展示名(通常为文件名)
 	manifest contract.Manifest
 	runtime  wazero.Runtime
-	mod      api.Module
-	mu       sync.Mutex
-	surface  contract.Surface
-	assets   map[string][]byte // .egop.zip 内 assets/ 静态文件(只读)
-	logFn    func(level, msg string)
-	unsubs   undo.Catcher // 事件订阅撤销统一栈(Close 释放)
-	broken   atomic.Bool  // 实例已关闭/被取消:后续调用 fail-closed
+	compiled wazero.CompiledModule // 池化锚:实例重建(revive)不再重编译
+	insts    []*inst
+	byName   map[string]*inst // wazero module 名 → inst(宿主注入函数经 m 认回)
+	poolMu   sync.Mutex       // 保护 insts/byName/compiled/lastCfg(生命周期读写收口)
+	// surface 经原子指针:宿主注入函数(热路径)无锁读,SetSurface 单写。
+	// 注册时序保证单写;读侧 surf() 无锁。
+	surfacePtr atomic.Pointer[contract.Surface]
+	assets     map[string][]byte // .egop.zip 内 assets/ 静态文件(只读)
+	logFn      func(level, msg string)
+	closed     atomic.Bool // 显式 Close():revive 不适用(注销/关停是终态)
 
-	netSeq    int64                // 出站流式 body 句柄序号(guard 下自增)
-	netBodies map[string]io.Reader // 句柄 → 未读完的响应 body(ImportNetBodyRead/Close 消费)
+	// revive 三件套:guest 代码字节 + 装载选项 + 最近生效配置——意外打断(ctx 取消
+	// 看门狗/trap)后按需重建实例并回放 init/config(插件内存态归零=热重启一次)。
+	wasmRaw  []byte
+	loadOpts Options
+	lastCfg  json.RawMessage
 }
 
 func newPlugin(name string) *Plugin {
-	return &Plugin{name: name, assets: map[string][]byte{}, netBodies: map[string]io.Reader{}}
+	return &Plugin{name: name, assets: map[string][]byte{}, byName: map[string]*inst{}}
 }
 
-// netAlloc 登记一条流式响应 body,返回字符串句柄(仅在宿主注入函数内、持锁时调用)。
-func (p *Plugin) netAlloc(r io.Reader) string {
-	p.netSeq++
-	key := fmt.Sprintf("%d", p.netSeq)
-	p.netBodies[key] = r
-	return key
-}
-
-// netGet 取句柄对应的 body 读端;未知/已关返回 nil。
-func (p *Plugin) netGet(handle string) io.Reader {
-	if p.netBodies == nil {
-		return nil
+// surf 读注入的 Surface 视图(未接线返回 nil)。原子读:宿主注入热路径无锁。
+func (p *Plugin) surf() contract.Surface {
+	if s := p.surfacePtr.Load(); s != nil {
+		return *s
 	}
-	return p.netBodies[handle]
+	return nil
 }
 
-// netClose 关闭并遗忘一条 body 句柄(幂等;body 若未实现 io.Closer 仅遗忘)。
-func (p *Plugin) netClose(handle string) {
-	if b, ok := p.netBodies[handle]; ok {
-		if c, ok := b.(io.Closer); ok {
-			_ = c.Close()
-		}
-		delete(p.netBodies, handle)
-	}
+// compiledModule 在 poolMu 下快照已编译模块(revive/growPool 用;Close 的
+// 关闭/置 nil 同锁——读写竞争收口)。
+func (p *Plugin) compiledModule() wazero.CompiledModule {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	return p.compiled
 }
 
-// asset 读打包静态资源(宿主注入函数上下文:已持锁)。
+// asset 读打包静态资源(装载后只读,无需锁)。
 func (p *Plugin) asset(name string) ([]byte, bool) {
 	b, ok := p.assets[name]
 	return b, ok
 }
 
-// recordUnsub 记录订阅撤销函数(同一把锁内;统一 effect 栈)。
-func (p *Plugin) recordUnsub(fn func()) { p.unsubs.Defer(fn) }
-
 // Meta 实现 base.Plugin。
 func (p *Plugin) Meta() contract.Meta { return p.manifest.Meta }
 
 // Assets 返回 .egop.zip 内 assets/ 静态资源表的只读副本(资源名→字节)。
-// 宿主据此下发插件自带的静态资产(如 UI 入口 JS);裸 .egop.wasm 形态返回空表。
+// 宿主据此下发插件自带的静态资产;裸 .egop.wasm 形态返回空表。
 // 返回值是副本:调用方改 map 不影响插件内部;字节切片本身视为只读。
 func (p *Plugin) Assets() map[string][]byte {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	out := make(map[string][]byte, len(p.assets))
 	for k, v := range p.assets {
 		out[k] = v
@@ -98,27 +80,28 @@ func (p *Plugin) Assets() map[string][]byte {
 }
 
 // Config 实现 contract.ConfigProvider:调 guest 的 egop_get_config 导出读回当前生效
-// 配置(权威读回);未导出/失败返回 nil → 宿主 EffectiveConfig 回退 applied 缓存。
-// 注意:egop_get_config 与 egop_meta 一样是"裸 JSON 读回"通道(非 err 信封)——见
-// SDK guest 的 egopGetConfigExport 与本包 testdata/config.wat。
+// 配置(权威读回,取任一空闲 inst);未导出/失败返回 nil → 宿主 EffectiveConfig 回退 applied 缓存。
 func (p *Plugin) Config() json.RawMessage {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.broken.Load() || p.mod == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), applyConfigTimeout)
+	defer cancel()
+	i, err := p.acquire(ctx)
+	if err != nil {
 		return nil
 	}
-	fn := p.mod.ExportedFunction(ExportGetConfig)
+	defer p.release(i)
+	if i.broken.Load() || i.mod == nil {
+		return nil
+	}
+	fn := i.mod.ExportedFunction(ExportGetConfig)
 	if fn == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), applyConfigTimeout)
-	defer cancel()
 	results, err := fn.Call(ctx)
 	if err != nil || len(results) != 1 {
 		return nil
 	}
 	ptr, ln := unpack(results[0])
-	s, err := readGuestString(p.mod.Memory(), ptr, ln)
+	s, err := readGuestString(i.mod.Memory(), ptr, ln)
 	if err != nil {
 		return nil
 	}
@@ -127,42 +110,101 @@ func (p *Plugin) Config() json.RawMessage {
 
 // CallFunc 实现 base.FunctionProvider。
 func (p *Plugin) CallFunc(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.mod == nil {
-		return nil, fmt.Errorf("wasm plugin %s: codeless bundle has no callable functions", p.name)
+	i, err := p.acquire(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer p.release(i)
+	// 意外打断自愈:上一调用被 ctx 取消/trap 打死 → 本次先重建实例(显式 Close 不复活)。
+	if i.broken.Load() {
+		if err := p.reviveLocked(ctx, i); err != nil {
+			return nil, err
+		}
+	}
+	// 持有标记:本调用栈持有本插件实例——嵌套 acquire(经宿主注入回调回同一插件)
+	// 据此识别同栈重入,池耗尽时立即 busy 回落而非等待自死锁。
+	ctx = withHeld(ctx, p)
 	args := []string{fname, string(input)}
 	// egop_call ABI 两版:4 参(fname,in)= 旧版 / 6 参(+origin)= 新版(第 3 参=
 	// 调用方来源 Origin 裸 JSON,SDK guest 读它并 WithOrigin 还原,使插件函数能经
 	// OriginFrom 知道"谁调了我";ctx 本身无法跨 wasm ABI)。精确匹配 6 才传第三参;
 	// 其它非法元数在装载期 validate 已按 ABI 不合规拒载。
-	if fn := p.mod.ExportedFunction(ExportCall); fn != nil && len(fn.Definition().ParamTypes()) == 6 {
+	if fn := i.mod.ExportedFunction(ExportCall); fn != nil && len(fn.Definition().ParamTypes()) == 6 {
 		originJSON, _ := json.Marshal(contract.OriginFrom(ctx))
 		args = append(args, string(originJSON))
 	}
-	return p.callExportLocked(ctx, ExportCall, args...)
+	return i.callExport(p, ctx, ExportCall, args...)
 }
 
-// ToolSpecs 实现 base.ToolProvider(来自线上清单 Manifest.Tools)。
-func (p *Plugin) ToolSpecs() []contract.FuncSpec { return p.manifest.Tools }
+// toolSpecsTimeout 活体工具面查询的兜底超时(同 ApplyConfig 形:接口无 ctx,
+// 在此设上限防 guest 挂起拖死收集方)。
+const toolSpecsTimeout = 10 * time.Second
 
-// ToolRaw 按名返回**无类型工具执行**闭包:tctx 即线上 JSON（ABI 同形;
-// 调用方负责把工具上下文序列化为该插件上下文的最小形状）。
+// ToolSpecs 实现 base.ToolProvider:**活体查询优先**(guest 导出
+// egop_tool_specs 时——动态工具插件如 MCP 的运行期发现真源),无导出/失败/
+// 实例已 broken 回落线上清单静态表(向后兼容旧 guest)。
+func (p *Plugin) ToolSpecs() []contract.FuncSpec {
+	ctx, cancel := context.WithTimeout(context.Background(), toolSpecsTimeout)
+	defer cancel()
+	if i, err := p.acquire(ctx); err == nil {
+		ctx = withHeld(ctx, p) // 同 CallFunc:嵌套重入标记
+		live := false
+		var out json.RawMessage
+		if i.mod != nil && !i.broken.Load() { // 注册期 mod 未挂:回落清单(装配序守卫)
+			if o, err := i.callExport(p, ctx, ExportToolSpecs); err == nil {
+				out, live = o, true
+			}
+		}
+		p.release(i)
+		if live {
+			var specs []contract.FuncSpec
+			if json.Unmarshal(out, &specs) == nil {
+				return specs
+			}
+		}
+	}
+	return p.manifest.Tools
+}
+
+// ToolRaw 按名返回**无类型工具执行**闭包:tctx 即线上 JSON(ABI 同形;
+// 调用方负责把工具上下文序列化为该插件上下文的最小形状)。
 // 结果以字符串形态返回供消费方直用。
 func (p *Plugin) ToolRaw(name string) (func(ctx context.Context, tctxJSON, args json.RawMessage) (string, error), bool) {
+	known := false
 	for _, s := range p.manifest.Tools {
 		if s.Name == name {
-			return func(ctx context.Context, tctxJSON, args json.RawMessage) (string, error) {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				out, err := p.callExportLocked(ctx, ExportTool, name, string(args), string(tctxJSON))
-				if err != nil {
+			known = true
+			break
+		}
+	}
+	if !known {
+		// 动态工具面:清单未录 ≠ 不存在——活体规格再查一遍(MCP 运行期发现)。
+		for _, s := range p.ToolSpecs() {
+			if s.Name == name {
+				known = true
+				break
+			}
+		}
+	}
+	if known {
+		return func(ctx context.Context, tctxJSON, args json.RawMessage) (string, error) {
+			i, err := p.acquire(ctx)
+			if err != nil {
+				return "", err
+			}
+			defer p.release(i)
+			if i.broken.Load() { // 意外打断自愈(同 CallFunc)
+				if err := p.reviveLocked(ctx, i); err != nil {
 					return "", err
 				}
-				return string(out), nil
-			}, true
-		}
+			}
+			ctx = withHeld(ctx, p) // 同 CallFunc:嵌套重入标记
+			out, err := i.callExport(p, ctx, ExportTool, name, string(args), string(tctxJSON))
+			if err != nil {
+				return "", err
+			}
+			return string(out), nil
+		}, true
 	}
 	return nil, false
 }
@@ -179,145 +221,91 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
-// ApplyConfig 实现 base.Configurable(guest 未导出 egop_apply_config 时拒绝下发;
-// 无代码包无 guest 可下发,返回干净错误而非 nil 解引用)。
+// ApplyConfig 实现 base.Configurable:全池下发(guest 未导出 egop_apply_config 时
+// 拒绝下发;无代码包无 guest 可下发,返回干净错误而非 nil 解引用)。
 func (p *Plugin) ApplyConfig(cfg json.RawMessage) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.mod == nil {
+	p.poolMu.Lock()
+	n := len(p.insts)
+	p.poolMu.Unlock()
+	if n == 0 {
 		return fmt.Errorf("wasm plugin %s: codeless bundle is not configurable", p.name)
 	}
-	if p.mod.ExportedFunction(ExportApplyConfig) == nil {
-		return fmt.Errorf("wasm plugin %s: export %q missing (not configurable)", p.name, ExportApplyConfig)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), applyConfigTimeout)
-	defer cancel()
-	if _, err := p.callExportLocked(ctx, ExportApplyConfig, string(cfg)); err != nil {
+	err := p.eachInst(func(i *inst) error {
+		if i.mod.ExportedFunction(ExportApplyConfig) == nil {
+			return fmt.Errorf("wasm plugin %s: export %q missing (not configurable)", p.name, ExportApplyConfig)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), applyConfigTimeout)
+		defer cancel()
+		if _, err := i.callExport(p, ctx, ExportApplyConfig, string(cfg)); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
+	p.poolMu.Lock()
+	p.lastCfg = append(json.RawMessage(nil), cfg...) // revive 回放锚
+	p.poolMu.Unlock()
 	return nil
 }
 
-// SetSurface 实现 base.SurfaceAware:注册时注入能力门控 Surface 视图,并执行 egop_init(若有导出)。
-// 初始化失败 = 实例置 broken(后续调用 fail-closed),注册本身不失败。
+// SetSurface 实现 base.SurfaceAware:注册时注入能力门控 Surface 视图,并对全池
+// 执行 egop_init(若有导出)。初始化失败的实例置 broken(后续调用 fail-closed 并
+// 在 acquire 时 revive),注册本身不失败。
 func (p *Plugin) SetSurface(s contract.Surface) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.surface = s
-	if p.mod != nil && p.mod.ExportedFunction(ExportInit) != nil {
-		// SetSurface 无 ctx:用固定兜底超时接看门狗,guest 挂起致 egop_init 死循环时打断。
-		ctx, cancel := context.WithTimeout(context.Background(), initTimeout)
-		defer cancel()
-		if _, err := p.callExportLocked(ctx, ExportInit); err != nil {
-			p.broken.Store(true)
+	p.surfacePtr.Store(&s)
+	_ = p.eachInst(func(i *inst) error {
+		if i.mod != nil && i.mod.ExportedFunction(ExportInit) != nil {
+			// SetSurface 无 ctx:用固定兜底超时接看门狗,guest 挂起致 egop_init 死循环时打断。
+			ctx, cancel := context.WithTimeout(context.Background(), initTimeout)
+			defer cancel()
+			if _, err := i.callExport(p, ctx, ExportInit); err != nil {
+				i.broken.Store(true)
+			}
 		}
-	}
+		return nil
+	})
 }
 
-// pushEvent 是订阅回调:把事件经 egop_on_event 推给 guest(尽力而为,未导出回调则丢弃)。
-// 统一事件结构:整个 contract.Event(含 Source/Labels)JSON 作为单参传给 guest。
-// 投递用 TryLock:事件总线同步扇出,回调可能落在"guest 自己正持锁调用中"的
-// goroutine 上(插件发布了命中自身订阅的事件)——阻塞取锁即同 goroutine 重入死锁。
-// 锁忙 = 本次投递丢弃(best-effort 观察面语义;不阻塞总线、不殃及其它订阅者)。
-func (p *Plugin) pushEvent(ctx context.Context, _ string, e contract.Event) {
-	if !p.mu.TryLock() {
-		return
-	}
-	defer p.mu.Unlock()
-	if p.broken.Load() || p.mod == nil {
-		return
-	}
-	fn := p.mod.ExportedFunction(ExportOnEvent)
-	if fn == nil {
-		return
-	}
-	raw, err := json.Marshal(e)
-	if err != nil {
-		return
-	}
-	ptr, err := allocWriteGuest(ctx, p.mod, raw)
-	if err != nil {
-		return
-	}
-	_, _ = fn.Call(ctx, uint64(ptr), uint64(len(raw))) // 事件投递 best-effort:失败静默(观察面不拦不改)
-}
-
-// invokeHook 把 hook 触发转发给 guest 的 egop_on_hook 导出,解其返回信封的
-// result 得到 HookResult(Block/Reason/Data;Who/At/Seq 由框架回填)。
-// 取锁用 TryLock(同 pushEvent:hook 触发可能同步重入持锁中的 guest 调用,阻塞
-// 即死锁);锁忙归一为非阻断 HookResult{Reason},触发方继续、hook 链不断。
-func (p *Plugin) invokeHook(ctx context.Context, hookID string, data json.RawMessage) any {
-	if !p.mu.TryLock() {
-		return contract.HookResult{Reason: "wasm plugin " + p.name + ": instance busy (hook skipped to avoid reentrant deadlock)"}
-	}
-	defer p.mu.Unlock()
-	if p.broken.Load() || p.mod == nil {
-		return contract.HookResult{Reason: "instance closed"}
-	}
-	fn := p.mod.ExportedFunction(ExportOnHook)
-	if fn == nil {
-		return contract.HookResult{}
-	}
-	args := []string{hookID, string(data)}
-	// egop_on_hook 第 3 参=触发来源 Origin(裸 JSON,精确 6 参才传,同 egop_call):
-	// SDK guest 读它并 WithOrigin 还原,使 hook 回调也能经 OriginFrom 知道
-	// "哪个框架点触发/谁触发"。老 WAT 夹具 4 参则跳过。
-	if len(fn.Definition().ParamTypes()) == 6 {
-		originJSON, _ := json.Marshal(contract.OriginFrom(ctx))
-		args = append(args, string(originJSON))
-	}
-	params := make([]uint64, 0, 4)
-	for _, a := range args {
-		ptr, err := allocWriteGuest(ctx, p.mod, []byte(a))
-		if err != nil {
-			return contract.HookResult{Reason: err.Error()}
-		}
-		params = append(params, uint64(ptr), uint64(len(a)))
-	}
-	results, err := fn.Call(ctx, params...)
-	if err != nil {
-		return contract.HookResult{Reason: err.Error()}
-	}
-	if len(results) != 1 {
-		return contract.HookResult{Reason: "bad result arity"}
-	}
-	ptr, ln := unpack(results[0])
-	s, err := readGuestString(p.mod.Memory(), ptr, ln)
-	if err != nil {
-		return contract.HookResult{Reason: err.Error()}
-	}
-	var env envelope
-	if err := json.Unmarshal([]byte(s), &env); err != nil {
-		return contract.HookResult{Reason: "bad result envelope"}
-	}
-	if !env.OK {
-		return contract.HookResult{Reason: env.Error}
-	}
-	var hr contract.HookResult
-	if len(env.Result) > 0 {
-		_ = json.Unmarshal(env.Result, &hr)
-	}
-	return hr
-}
-
-// Close 关闭实例:撤销订阅、尽力执行 egop_shutdown、关模块与运行时。
+// Close 关闭全池:撤销订阅、尽力执行 egop_shutdown、关模块与运行时。
+// 显式关闭是终态:之后的调用不再 revive(与意外打断的可恢复语义区分)。
 func (p *Plugin) Close(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.closed.Store(true)
 	var errs []error
-	if err := p.unsubs.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if p.mod != nil {
-		if p.mod.ExportedFunction(ExportShutdown) != nil {
-			// 优雅关停设兜底超时(调用方 ctx 常为 Background);超时经看门狗打断后仍续关 module/runtime。
-			sctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
-			if _, err := p.callExportLocked(sctx, ExportShutdown); err != nil {
+	p.poolMu.Lock()
+	insts := append([]*inst(nil), p.insts...)
+	p.insts = nil
+	p.byName = map[string]*inst{}
+	p.poolMu.Unlock()
+	for _, i := range insts {
+		i.mu.Lock()
+		if err := i.unsubs.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		if i.mod != nil {
+			if i.mod.ExportedFunction(ExportShutdown) != nil {
+				// 优雅关停设兜底超时(调用方 ctx 常为 Background);超时经看门狗打断后仍续关 module/runtime。
+				sctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
+				if _, err := i.callExport(p, sctx, ExportShutdown); err != nil {
+					errs = append(errs, err)
+				}
+				cancel()
+			}
+			if err := i.mod.Close(ctx); err != nil {
 				errs = append(errs, err)
 			}
-			cancel()
 		}
-		if err := p.mod.Close(ctx); err != nil {
+		i.netCloseAll()
+		i.broken.Store(true)
+		i.mu.Unlock()
+	}
+	p.poolMu.Lock()
+	compiled := p.compiled
+	p.compiled = nil
+	p.poolMu.Unlock()
+	if compiled != nil {
+		if err := compiled.Close(ctx); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -326,91 +314,23 @@ func (p *Plugin) Close(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	for h := range p.netBodies {
-		p.netClose(h)
-	}
-	p.broken.Store(true)
 	return errors.Join(errs...)
 }
 
-// callExportLocked 要求已持锁(宿主注入函数/SetSurface/Close 上下文复用)。
-// ctx 取消 → 看门狗经 CloseWithExitCode 打断 guest 并把实例置 broken。
-func (p *Plugin) callExportLocked(ctx context.Context, fname string, args ...string) (json.RawMessage, error) {
-	if p.broken.Load() {
-		return nil, fmt.Errorf("wasm plugin %s: instance closed", p.name)
-	}
-	fn := p.mod.ExportedFunction(fname)
-	if fn == nil {
-		return nil, fmt.Errorf("wasm plugin %s: export %q missing", p.name, fname)
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	done := make(chan struct{})
-	defer close(done)
-	var finished atomic.Bool
-	if ctx.Done() != nil { // 可取消才装看门狗;Background 不浪费每调 goroutine
-		go func() {
-			select {
-			case <-done:
-			case <-ctx.Done():
-				if finished.Load() {
-					return // 调用已完成:迟到的取消不再误打断/误置 broken
-				}
-				_ = p.mod.CloseWithExitCode(ctx, 255)
-				p.broken.Store(true)
-			}
-		}()
-	}
-	params := make([]uint64, 0, len(args)*2)
-	for _, a := range args {
-		ptr, err := allocWriteGuest(ctx, p.mod, []byte(a))
-		if err != nil {
-			return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, fname, err)
-		}
-		params = append(params, uint64(ptr), uint64(len(a)))
-	}
-	results, err := fn.Call(ctx, params...)
-	finished.Store(true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("wasm plugin %s: %s: interrupted: %w", p.name, fname, ctx.Err())
-		}
-		return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, fname, err)
-	}
-	if len(results) != 1 {
-		return nil, fmt.Errorf("wasm plugin %s: %s: bad result arity", p.name, fname)
-	}
-	ptr, ln := unpack(results[0])
-	s, err := readGuestString(p.mod.Memory(), ptr, ln)
-	if err != nil {
-		return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, fname, err)
-	}
-	var env envelope
-	if err := json.Unmarshal([]byte(s), &env); err != nil {
-		return nil, fmt.Errorf("wasm plugin %s: %s: bad result envelope: %w", p.name, fname, err)
-	}
-	if !env.OK {
-		return nil, fmt.Errorf("wasm plugin %s: %s: %s", p.name, fname, env.Error)
-	}
-	if env.ResultB64 != "" {
-		data, err := base64.StdEncoding.DecodeString(env.ResultB64)
-		if err != nil {
-			return nil, fmt.Errorf("wasm plugin %s: %s: bad result_b64: %w", p.name, fname, err)
-		}
-		return data, nil
-	}
-	return env.Result, nil
-}
-
-// callMeta 无信封特殊通道:仅 egop_meta 用(裸 manifest JSON)。
+// callMeta 无信封特殊通道:仅 egop_meta 用(裸 manifest JSON;装载期单实例上下文)。
 func (p *Plugin) callMeta(ctx context.Context) (json.RawMessage, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.broken.Load() {
+	p.poolMu.Lock()
+	i := p.insts[0]
+	p.poolMu.Unlock()
+	if i == nil {
 		return nil, fmt.Errorf("wasm plugin %s: instance closed", p.name)
 	}
-	fn := p.mod.ExportedFunction(ExportMeta)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.broken.Load() {
+		return nil, fmt.Errorf("wasm plugin %s: instance closed", p.name)
+	}
+	fn := i.mod.ExportedFunction(ExportMeta)
 	if fn == nil {
 		return nil, fmt.Errorf("wasm plugin %s: export %q missing", p.name, ExportMeta)
 	}
@@ -422,7 +342,7 @@ func (p *Plugin) callMeta(ctx context.Context) (json.RawMessage, error) {
 		return nil, fmt.Errorf("wasm plugin %s: %s: bad result arity", p.name, ExportMeta)
 	}
 	ptr, ln := unpack(results[0])
-	s, err := readGuestString(p.mod.Memory(), ptr, ln)
+	s, err := readGuestString(i.mod.Memory(), ptr, ln)
 	if err != nil {
 		return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, ExportMeta, err)
 	}

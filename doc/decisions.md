@@ -99,3 +99,145 @@ zip 解压设单条目/聚合双上限（默认 256MiB/1GiB，头部声明预检
 落盘服务也安全）。包后缀只内置 `.egop.wasm`/`.egop.zip`：品牌/项目自有后缀经
 `Options.ExtraSuffixes` 装配注入（内容无关库不内置业务词），判定收敛在
 `wasm.IsPluginFile` 单点——扫描侧与装载侧永不分叉。
+
+## 16. Meta 注册快照:入册即深拷贝(CloneMeta)
+
+宿主在 Register/Replace 入册时经 `contract.CloneMeta` 深拷贝 Meta(全部
+slice/map/RawMessage 字节)。原因:`h.meta[id]=m` 值拷贝只拷壳,Provides/Requires
+的引用部件与插件侧共享——插件注册后改写自己的 Meta(或并发读写)会让宿主的
+八轴校验/Dependents/控制面视图静默漂移,还构成数据竞争面。快照代价(注册路径
+低频、字段量小)可忽略;宿主外发(Plugins/Snapshot)共享同一份冻结拷贝也安全。
+
+## 17. 扩展键值铺满全部声明结构 + `egop.` 保留前缀
+
+`Extensions map[string]json.RawMessage`(即 JSON 世界的 (key string, value any))
+从 Meta/FuncSpec 铺满到 HookPointSpec/EventTopicSpec/ConfigFieldSpec/Dependency/
+SlotSpec——「没被固定字段覆盖的自定义含义」在每一层声明上都有同一形状的口子,
+取值助手 `contract.Ext[T]`。键空间保留前缀 `egop.`(ReservedExtPrefix)给 egop
+自身特性(在用:egop.pool):开发者自定义键不用它,未来 egop 新键不与用户撞名。
+egop 此前在 `egop.pool` 上开了库读用户可见扩展键的先例却无保留约定,是潜在撞名源。
+
+## 18. 四个"声明了但零接线"的轴,接线或删除
+
+契约里声明了语义但机制层零消费的词汇一律处置(声明面在说谎是最差状态):
+- `ConfigFieldSpec.Secret`:接进 SetConfig 观察事件脱敏,**声明优先**——顶层命中
+  即遮(键名不敏感也遮),键名子串启发(token/secret/…)降为兜底。声明真源优于启发。
+- `HookPointSpec.Kind`(observe):接进 TriggerHook——observe 点回调的 Block 按
+  声明丢弃(Reason 注明);modify(缺省)不限制。声明表(hookDecls)注册/替换/删除
+  后全量重建,注册序=首声明者序(同名 hook 点多声明者并立是合法形状,hook 总线
+  本就是平字符串命名空间)。
+- `Meta.DependsOn`:删除。注释自认"遗留纯声明",全库零消费,死词只会误导
+  (pre-1.0 直接 breaking,不走迁移文档)。
+- `Provides.Events/Points/Listens`:保持**描述性**(发现/槽位契约轴),运行时
+  发布仍按 event.emit 能力门控——但补上真正的完整性漏洞:**框架保留主题**
+  (plugin.* 生命周期 + plugin.config.updated,contract.IsFrameworkTopic)插件经
+  Surface 不可发布(单点拒发+留痕)。防插件伪造 plugin.removed 欺骗软依赖方。
+  全面强制"发布仅限声明/自有 dyn.* 命名空间"被否决:会打死跨插件主题约定、
+  需重编一批夹具,完整收益不成比例。
+- `HookPointSpec.Desc`→`Description`(与其它结构统一拼写);`Dependency` 双空
+  (Plugin/Slot 皆无)注册口拒载,双取 Slot 优先,未知 Kind 前向兼容忽略。
+
+## 19. 函数目录键空间:函数名禁 `"."`,id 允许含点
+
+`h.fns` 以 `id + "." + fname` 为键:函数名含点会让插件 `a` 的函数 `b.c` 与插件
+`a.b` 的函数 `c` 撞键(表现为费解的 function conflicts)。裁决:**函数名禁 `"."`
+与空白**(注册口单点 fail-closed),插件 id 保留含点(vendor.name 命名惯例合法,
+撞键由函数名单侧封死)。同批:插件 id 拒空白/控制字符。
+
+## 20. 能力词保持裸词,作用域参数不入契约轴
+
+capabilities 维持 `[]string` 裸词(门控=布尔)。作用域(如 net.access 限域名、
+fs.read 限目录)两处安放:策略在注入实现(Net/FS 后端自行收窄),插件想**自述
+最小特权**写进 Extensions 按约定(后端读取并强制)。不给能力词加结构化参数轴:
+会引入 per-能力校验语义,内容无关库解释不了任意业务作用域。
+
+## 21. wasm 实例池:TryLock + ctx 重入标记,不用配额信号量
+
+决策 11 的跳过语义保留给**事件/hook 投递**,但**调用链**的嵌套重入不能再丢
+(eha 嵌套轮 live 事故):每实例一把锁,入口 TryLock 空闲实例——并发度由实例数
+自然约束。同 goroutine 嵌套重入(宿主注入函数回调宿主、宿主再进同一插件)经
+**ctx 重入标记**识别(acquire 成功后注入,经 wazero ctx 透传给宿主注入函数):
+有其它空闲实例即取第二实例;池耗尽**立即**返回 busy 错误——此时等待即自死锁。
+池大小由清单保留键 `egop.pool` 声明(缺省 1,上限 4;zip 与裸 wasm 都生效)。
+
+曾试过"同容量信号量配额"制,在三处翻车后拆除(2026-09-16 修复):Close 置
+nil 后 release `<-nil` 永挂(在册调用的 Host.Call 永不返回)、growPool 换 sem
+破坏配额账、嵌套等待只认 ctx.Done 对 Background ctx 永挂。TryLock+标记在
+语义不变的前提下无配额簿记可翻车。
+
+**观察面钉主实例**:事件订阅与 hook 注册只挂 `insts[0]`,投递也只投主实例
+——池>1 时每实例 init 各自订阅的"事件双投递/落点漂移"与 revive 累积 hook
+注册(撤销挂错栈)都在此一并修正;次实例声明按无操作忽略。
+
+## 22. revive:打断自愈 = 对单实例做一次热重启
+
+ctx 取消看门狗/runtime trap 打断的实例不废插件:下次调用先重建(复用 compiled
+不重编译)、`egop_init` 重放(guest 自挂订阅)、最近生效配置回放——内存态归零,
+KV 等宿主侧持久态不受影响。显式 Close 是终态不复活(注销/关停与意外打断是两类
+事件)。备份三锚(wasm 字节/装载选项/最近配置)留在 Plugin 上。
+
+## 23. 活体工具面 egop_tool_specs:清单未录 ≠ 不存在
+
+动态工具插件(如 MCP 客户端)的工具面是运行期发现的,线上清单只是快照。可选导出
+`egop_tool_specs` 是活体真源:`ToolSpecs` 优先调它,无导出/失败/断后回落清单
+`Manifest.Tools`(旧 guest 零影响);`ToolRaw` 对清单外名字再查一遍活体面。
+注:这曾引入"宿主面(host.Tools 收集)在持 h.mu 下调插件代码"的同 goroutine
+死锁面(plugins/call 注入都取 h.mu)——已修:收集方锁内只取 provider 快照、
+锁外调(tools_lock_test 回归固化;AGENTS 已立不变量"持 h.mu 期间绝不调插件
+代码")。
+
+## 24. guest 两个保护:真系统时钟 + fs_read 尺寸护栏
+
+- wazero ModuleConfig 缺省 Walltime/Nanotime/Nanosleep 是**假钟桩**(纪元 2022/
+  ENOSYS):guest 内 time.Now/Since/Sleep 全部静默错乱(TTL/退避类插件必踩)。
+  实例化一律接 `WithSysWalltime/WithSysNanotime/WithSysNanosleep`,clock.wat
+  夹具固化防回退。
+- wasm ABI `fs_read` 单次回传上限 8MiB:base64 信封放大 4/3 灌进 guest 64MiB
+  线性内存前在宿主侧拒读(grep /tmp 撞 34MB 固件 OOM trap 实锤;symlink 预筛
+  防不住)。护栏在读完之后校验——宿主侧缓冲完整文件的成本由注入实现自管。
+
+## 25. autoload 失败件跨轮重试:失败也是进展
+
+装载/注册失败的文件**保留观察槽**且 pending=当前 hash,下一轮 Poll 直接重试——
+依赖链乱序(DepInit 目标后落地)时先失败件必须能跨轮补载(旧语义 delete 观察槽,
+zip-only 装配实锤下 subagents 永不落载)。mount 首装把 ActionFailed 也算"进展"
+(否则拍稳停轮会把重试中的插件永久落下)。代价(显式接受):永久坏件每轮重试、
+每轮一条 failed 事件;mount 首装上限 maxInitRounds=64 兜底。已知待优化:重试是
+整 LoadFS(全量重编译),应区分"内容坏(等 hash 变)"与"依赖未就绪(保住已加载
+实例只重试 Register)"。
+
+## 26. 远程通道入站请求并发派发(有界),不再内联
+
+recvLoop 曾把入站请求帧(CallFunc/Tool/Hook/ApplyConfig/HostCall)**内联同步**处理:
+一个慢 op 队头阻塞整条会话(其它请求的回复路由、事件推送全部排队),同会话自调
+(插件经 HostCall 回程调回自己)更是永久死锁——嵌套请求帧只有这条忙着的读循环能读。
+裁决:请求类帧派发到**带界工作 goroutine**(每会话 32 配额,满即回执 busy 背压,
+绝不阻塞读循环);回复路由、Subscribe/Ping、push_event 保持内联(事件投递保序,
+慢处理器是插件自己的事)。代价(显式接受):入站请求的**处理不再保序**(帧按序
+读入、回复按 id 关联,顺序无依赖);插件侧 PluginOps 回调可能**并发**——与进程
+内插件 CallFunc 的既有并发语义对齐(作者侧回调须线程安全)。配套:响应 body
+句柄(per-handle 锁)串行化同句柄的读/关——并发派发后 io.Reader 撕裂是真实风险。
+回归:TestSameSessionNestedSelfCall(旧形状直接死锁,测试超时)。
+
+## 27. 投递看门狗 + wasm 字段竞争收口
+
+- pushEvent/invokeHook 直调 fn.Call 无看门狗:挂死的 guest on_event/on_hook 会
+  永挂总线同步扇出的 goroutine(发布方实例锁永不释放)。callExport 的看门狗机制
+  抽成 callCore 共享:投递用 **10s 兜底时限 + WithoutCancel**——发布者/触发方
+  ctx 的取消不传导(投递是 fire-and-forget,接受即送达或超时打断),只有时限
+  经 CloseWithExitCode 打断(broken→下次调用 revive)。egop_on_event 走 callVoid
+  (无返回值形态),egop_on_hook 走 callExport(信封复用)。
+- 竞争收口:Close↔revive、ApplyConfig↔revive 对 p.compiled/p.lastCfg 的读写
+  经 poolMu 快照;instantiateOne 显式收 compiled 参数;p.surface 改原子指针
+  (宿主注入热路径无锁读,SetSurface 单写)。
+
+## 28. autoload 失败重试分层(落地 #25 记的待优化)
+
+#25 的"失败件跨轮重试"代价是每轮全量重编译(永久坏件 mount 空转 64 轮、watch
+每秒编译一次)。分层修正:内容坏(LoadFS 失败/契约拒载)记 errHash——**hash
+未变不重试**(等真变化,重新两段确认再试);注册瞬态失败(依赖未就位)**保留
+已装载实例 np**,后续轮次只重试 Register(不重编译;依赖到位后注册的正是保留
+实例)。mount 首装自然收敛(内容坏件不再每轮产出 ActionFailed)。配套:mount
+的 accept/ServeStream goroutine 计入 WaitGroup,Close 释锁后 join——关停不留
+迟到注册窗口。回归:TestFailedContentNotRetriedUntilChange、
+TestRegisterFailureKeepsInstance。

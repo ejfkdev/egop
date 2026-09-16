@@ -30,7 +30,6 @@ type Meta struct {
     Provides Provides // 供给面
     Requires Requires // 依赖面
     Slot     string   // 声称实现的槽位
-    DependsOn []string // 遗留纯声明依赖(展示/排序用,非强制校验轴)
     Extensions map[string]json.RawMessage // 自由扩展键值(非契约轴,开发者自约定,egop 不解释)
 }
 ```
@@ -38,10 +37,25 @@ type Meta struct {
 `Homepage`/`License`/`Authors`/`Tags` 是**描述性元数据**（非契约轴，供目录、控制面展示与检索），
 均 `omitempty`，旧清单不带它们也照常解析。
 
-`Extensions` 是**自由扩展键值**：任意 `key` → 任意 JSON 值，完全由开发者自行约定，
+**注册快照不变量**：宿主在 Register/Replace 入册时经 `contract.CloneMeta` 深拷贝 Meta
+（全部 slice/map/RawMessage 字节）。入册后插件侧如何改写自己的 Meta 都不影响宿主
+目录/校验/控制面视图；`Host.Plugins()`/`Snapshot()` 外发的是同一份冻结拷贝（按只读共享）。
+插件侧也不必担心宿主修改自己的 Meta——宿主从不回写。
+
+`Extensions` 是**自由扩展键值**：任意 `key` → 任意 JSON 值（即 JSON 世界的
+`(key string, value any)`），完全由开发者自行约定，
 egop **不解释、不校验、不参与任何轴求差**，只在 JSON 契约里原样透传（供目录/控制面/
 其它插件按 key 读取自定义能力声明、业务元数据、UI 提示等）。这是给「没被固定字段覆盖的
 自定义含义」留的口子——egop 内容无关、不做格式约束。
+
+**扩展键保留前缀 `egop.`**（`contract.ReservedExtPrefix`）：egop 自身特性经该前缀键约定
+（目前唯一在用：`Meta.Extensions["egop.pool"]` 实例池大小）。开发者自定义键**不应**使用
+该前缀——未来 egop 版本可能在前缀下引入新键，撞名即语义漂移；反向同理，egop 绝不解释
+任何非保留前缀键。
+
+**Extensions 不止于 Meta**：同一形状的自由键值铺在全部声明结构上——`FuncSpec`
+（函数/工具共用）、`HookPointSpec`、`EventTopicSpec`、`ConfigFieldSpec`、`Dependency`、
+`SlotSpec`。取值助手 `contract.Ext[T](ext, key)`（缺键/解码失败返回零值+false）。
 
 **Provides（我提供什么）**：
 
@@ -111,7 +125,8 @@ typed 包装永远在消费方装配层。
 | 可监点 | `listens` | `listens` |
 | 工具依赖 | `needs_tools` | `needs_tools` |
 
-另有 `needs`（前置槽位名清单,与 `Meta.Requires.Deps` 形状不同）、`builtin bool`。
+另有 `needs`（前置槽位名清单,与 `Meta.Requires.Deps` 形状不同）、`builtin bool`、
+`Extensions`（自由扩展键值,同 Meta.Extensions;槽位定义方=装配层挂自定义元数据）。
 
 ## 5. 能力词（capabilities）
 
@@ -135,6 +150,13 @@ typed 包装永远在消费方装配层。
 
 动态点位/主题 id 前缀：`dyn.`（`PointID`/`EventID` 做命名空间化）。
 
+**框架保留主题**（`contract.IsFrameworkTopic`）：`plugin.config.updated` 与
+`plugin.registered` / `plugin.removed` / `plugin.replaced` / `plugin.failed` 是
+宿主专署广播主题——插件经 Surface 发布这些主题会被**单点拒发并留痕**。这防止插件
+伪造 `plugin.removed` 等生命周期事件欺骗软依赖方/控制面（框架事件的
+`Source.Kind=host` 是唯一真源）。插件的事件声明（`Provides.Events`）是发现/槽位
+契约轴,运行时发布仍按 `event.emit` 能力门控（不逐主题强制）。
+
 ## 6. Surface 能力面
 
 注册时宿主按 `Meta.Provides.Capabilities` 注入**裁剪后的** `contract.Surface` 视图。方法见
@@ -153,6 +175,10 @@ api.md 的 Surface 能力面；每条能力的门控语义见 usage.md 的"ctx �
 
 两层同时满足才放行：调用方要有能力词 + 目标字段要标记。典型例子——某 `apikey`
 字段 `Writable:true, Readable:false`：egop 可读写，别的插件只能写入、读不回。
+
+`Secret` 标记敏感字段：宿主下发配置的观察事件（`plugin.config.updated`）做**声明优先
+脱敏**——顶层命中 `Secret:true` 的键无条件遮（键名不敏感也遮），未声明键走键名子串
+启发（token/secret/…）兜底；宿主内部 `applied` 缓存保留全值供热更回灌。
 
 跨插件访问经 `Surface.GetConfig(pluginID, key)`（读）/ `Surface.SetConfig(pluginID, key, value)`
 （写，单字段合并）。**写语义**：`Host.SetConfig(id, cfg)` 是整对象替换；`Host.SetConfigField` 是
@@ -173,6 +199,11 @@ api.md 的 Surface 能力面；每条能力的门控语义见 usage.md 的"ctx �
 `host.Options.Storage` **必填注入**，宿主把**原始 pluginID** 转发给实现——命名空间、
 目录布局、hash 等存储策略由实现自行决定（egop 不越权、不内置任何文件/网络能力）。
 未注入则 `Persist()`/`KV()` 返回不可用。
+
+`FileStore` 四法：`Read/Write/Append/List`。**`Write` 是整文件覆盖语义**，
+`Append` 是末尾追加（append-only 日志/事实账的真源——拿 `Write` 追加等于每次
+截断只留末行）。跨世界同构：wasm ABI `persist_read`/`persist_write`/
+`persist_append`/`persist_list` 与远程通道同名词汇。
 
 ### 出站网络
 
@@ -195,12 +226,20 @@ DataChannel/WebTransport/MQTT-over-WS）统一走 `Net.DialStream`（URL scheme 
 
 `Surface.FS()`（`fs.read` / `fs.write`）提供插件对**宿主文件系统的一个显式受控
 视图**——与 `storage.persist`（插件专属隔离目录）互补：装配层实现 `contract.FS`
-（`ReadFile`/`WriteFile` 两法）并从 `host.Options.FS` 注入，可见范围/沙箱/路径
-白名单策略**完全由实现决定**（可给 `io/fs.Sub` 子树视图、只读镜像等；egop 不实现
-任何平台 IO）。读写按声明**分向门控**（宿主 `fsGuard` 单点强制）：只声明 `fs.read`
-者 `WriteFile` 报错，反之亦然；两者都未声明或后端未注入时 `FS()` 返回不可用。
-跨世界同构：wasm ABI `fs_read`/`fs_write` 与远程通道 `OpFSRead`/`OpFSWrite` 走
-同一门控视图。
+（`ReadFile`/`WriteFile`/`ReadDir` 三法）并从 `host.Options.FS` 注入，可见范围/
+沙箱/路径白名单策略**完全由实现决定**（可给 `io/fs.Sub` 子树视图、只读镜像等；
+egop 不实现任何平台 IO）。读写按声明**分向门控**（宿主 `fsGuard` 单点强制）：
+只声明 `fs.read` 者读与列目录可用、`WriteFile` 报错，反之亦然；两者都未声明或后端
+未注入时 `FS()` 返回不可用。`ReadDir(name)` 列举目录一层条目（不递归），返回
+`[]contract.DirEntry{Name, IsDir, Size?, ModTime?}`（目录 Size=0,ModTime unix 毫秒、
+0=未知；旧 guest 忽略新字段,ABI JSON 增量安全）。跨世界同构：wasm ABI
+`fs_read`/`fs_readdir`/`fs_write` 与远程通道 `OpFSRead`/`OpFSReadDir`/`OpFSWrite`
+走同一门控视图。
+
+**fs_read 尺寸护栏**：wasm ABI 的 `fs_read` 单次回传上限 `wasm.MaxFSReadBytes`
+（8MiB）——base64 信封放大 4/3 灌进 guest 线性内存（上限 64MiB）前在宿主侧拒读
+（巨文件/symlink 目标；工具语义层可再收紧）。注意护栏在**读完后**校验：宿主侧
+缓冲完整文件的成本由注入实现自管（实现可先行 Stat/Lstat 收窄）。
 
 ### 溯源 Origin
 
@@ -246,6 +285,11 @@ type HookResult struct {
 `contract.HookResultOf` 归一成 `HookResult`（`Block=false`、`Data`=该值的 JSON 编码）。
 框架在触发时统一回填 `Origin`（`ID/版本/Kind:"hook"/Point/At`）与 `Seq`——"阻断"不靠
 返回 nil/false 含糊判定，且有"谁、何时、第几个"的执行上下文（与事件/调用的来源同构）。
+
+**observe 点强制**：hook 点声明（`HookPointSpec.Kind`）为 `observe` 时，回调的
+`Block` 无效——`Host.TriggerHook` 收集结果时按声明丢弃 `Block` 并在 `Reason` 注明
+（观察者不得阻断流程；声明优先）。`modify`（缺省）不限制。声明表在注册/替换/删除后
+全量重建（同名 hook 点多声明者并立时按注册序取首声明者）。
 宿主注入）注册，触发时框架把 hook 帧 / `egop_on_hook` 回调送进插件，与 Go 侧
 `OnHook` 同语义。
 
@@ -257,9 +301,12 @@ type Dependency struct {
     Slot       string         `json:"slot,omitempty"`   // 点到槽位面
     Kind       DependencyKind `json:"kind"`             // init | call | soft
     MinVersion string         `json:"min_version,omitempty"`
+    Extensions map[string]json.RawMessage `json:"extensions,omitempty"` // 自由扩展键值(同 Meta.Extensions)
 }
 ```
 
+- `Plugin`/`Slot` **必须恰有其一**（双空在注册口拒载；双取时 `Slot` 优先生效,
+  与装载排序/卸载判定同款）；未知 `Kind` 前向兼容地忽略（不参与任何校验）。
 - `DepInit`：硬依赖，注册顺序/拓扑排序的关键边（未满足即拒注；卸载时 fail-closed 或级联）；
 - `DepCall`：跨插件调用关系，配合 `plugin.call` 能力（声明「本插件会调用对方函数」）；
 - `DepSoft`：**软依赖**，不参与装载排序、不拦卸载——依赖方应订阅
@@ -272,15 +319,17 @@ type Dependency struct {
 | 导出 | 用途 | 是否必须 |
 |---|---|---|
 | `egop_host_alloc` | 宿主写入参数字节前的分配函数 | 必须 |
+| `_initialize` / `_start` | Go wasip1 插件初始化（reactor/command 两模式；宿主按 `_initialize` 优先列出，wazero 对缺失者宽容跳过——保证 Go 插件运行时在 `egop_meta` 前就位） | 可选 |
 | `egop_meta` | 无内嵌清单段时的清单来源（返回裸 Manifest JSON） | 条件 |
-| `egop_init` | 注册完成后调一次 | 可选 |
+| `egop_init` | 注册完成后调一次（**全池每实例各一次**） | 可选 |
 | `egop_call` | 声明了 functions 时必需 | 条件 |
 | `egop_tool` | 声明了 tools 时必需 | 条件 |
-| `egop_apply_config` | 可下发配置 | 可选 |
+| `egop_tool_specs` | 活体工具面查询（返回 `[]FuncSpec` 信封；**动态工具插件如 MCP 客户端的运行期发现真源**。无导出/失败/断后回落线上清单 `Manifest.Tools`——旧 guest 不受影响） | 可选 |
+| `egop_apply_config` | 可下发配置（全池逐实例下发） | 可选 |
 | `egop_get_config` | 当前生效配置权威读回（裸 JSON；缺省回退宿主 applied 缓存） | 可选 |
 | `egop_on_event` | 事件推送回调（入参是完整 `contract.Event` JSON） | 可选 |
 | `egop_on_hook` | hook 触发回调（返回 HookResult 信封） | 可选 |
-| `egop_shutdown` | 卸载钩子 | 可选 |
+| `egop_shutdown` | 卸载钩子（全池逐实例尽力执行） | 可选 |
 
 参数/返回约定：字符串 = guest 内存 `(ptr,len)` 成对；除 `egop_meta` /
 `egop_get_config`（裸 JSON）与 `egop_on_event`（无返回）外，均返回结果信封
@@ -293,21 +342,44 @@ type Dependency struct {
 `contract.WithOrigin` 还原进 ctx）。宿主按导出精确元数选择传参；其它元数在装载期
 按 ABI 不合规拒载。
 
-**投递重入语义**：`egop_on_event` / `egop_on_hook` 的宿主侧投递经 `TryLock`——
-guest 实例忙（正执行调用，含"插件发布命中自身订阅的事件"这类同 goroutine 同步
-扇出重入）时本次投递跳过（事件丢弃 / hook 记 `Reason`），绝不阻塞取锁造成对
-非重入实例锁的自死锁。
+**投递重入语义**：`egop_on_event` / `egop_on_hook` 的宿主侧投递非阻塞锁定主实例
+（`tryAcquirePrimary`）——guest 实例忙（正执行调用，含"插件发布命中自身订阅的事件"这类
+同 goroutine 同步扇出重入）时本次投递跳过（事件丢弃 / hook 记 `Reason`），绝不
+阻塞造成对非重入实例锁的自死锁。投递带 **10s 兜底时限的看门狗**：挂死的 guest
+处理器经 `CloseWithExitCode` 打断（broken→下次调用 revive），事件总线/触发方
+不被永挂；发布者 ctx 的取消不传导（fire-and-forget：接受即送达或超时）。
+
+### 实例池与自愈（egop.pool / revive）
+
+- **实例池**：清单扩展 `Meta.Extensions["egop.pool"]`（保留前缀键）声明并发池
+  大小（缺省 1，上限 `maxPool=4`；zip 与裸 `*.egop.wasm` 形态都生效——后者在
+  清单可读后补池）。每实例一把互斥锁；调用/工具入口 **TryLock 空闲实例**——
+  并发度由实例数自然约束（无配额信号量）。**同调用栈嵌套重入**（宿主注入函数
+  回调宿主、宿主再进同一插件）经 ctx 重入标记识别：有其它空闲实例即取第二
+  实例；池耗尽**立即**返回 `all instances busy`（调用方回落）——此时等待即
+  自死锁，绝不阻塞。
+- **观察面钉主实例**：事件订阅与 hook 注册只挂主实例（`insts[0]`），投递也只
+  投主实例——池>1 时事件/hook 语义不随池放大（不双投递、不漂移）；次实例的
+  订阅/hook 声明按无操作忽略。revive 重放 init 时撤销随主实例清退,不累积。
+- **系统时钟**：实例化接 `WithSysWalltime/Nanotime/Nanosleep`——wazero 缺省是
+  假钟桩（纪元 2022/ENOSYS），guest 内 time.Now/Sleep 会静默错乱；有
+  `testdata/clock.wat` 夹具固化。
+- **revive（打断自愈）**：调用被 ctx 取消看门狗/runtime trap 打断的实例置 broken，
+  下一次调用先**重建**（复用已编译模块不重编译；`egop_init` 重放重挂订阅、最近
+  生效配置回放——插件内存态归零=一次热重启，KV 等宿主侧持久态不受影响）。显式
+  `Close` 是终态，不复活。
 
 ### 宿主注入（module `egop`）
 
 函数名即能力名：`call` / `get_setting` / `persist_read` / `persist_write` /
-`persist_list` / `kv_get` / `kv_put` / `kv_delete` / `kv_keys` / `exec` /
+`persist_append`（末尾追加,与 persist_write 整文件覆盖语义分开）/ `persist_list` /
+`kv_get` / `kv_put` / `kv_delete` / `kv_keys` / `exec` /
 `op`（通用扩展：op 名 + 入参）/ `publish_event` / `subscribe_event` / `on_hook`
 （hook）/ `plugins` / `get_plugin`（plugin.meta 目录/元数据）/ `get_config` /
 `set_config`（config.read/write 跨插件配置）/ `read_asset` / `fs_read` /
-`fs_write`（fs.read/write 全局文件系统）/ `net_request` / `net_body_read` /
-`net_body_close`（net.access 出站网络：整包请求上线、响应 body 流式读回、句柄
-显式关闭）/ `log`。
+`fs_readdir`（列目录一层,JSON 数组）/ `fs_write`（fs.read/write 全局文件系统）/
+`net_request` / `net_body_read` / `net_body_close`（net.access 出站网络：整包请求
+上线、响应 body 流式读回、句柄显式关闭）/ `log`。
 
 返回 `i64` = `(len<<32)|ptr`，指向经 `egop_host_alloc` 分配的结果信封。
 
@@ -332,6 +404,10 @@ guest 实例忙（正执行调用，含"插件发布命中自身订阅的事件"
 `subscribe` / `push_event` / `shutdown` / `ping`。
 
 - 请求/回复按 `id` 关联；单向帧（push_event / shutdown）`id=0`；
+- **入站请求并发派发**（有界 32/会话）：一个慢 op 不再队头阻塞整条会话、
+  同会话自调不再死锁；超额回执 busy 背压。代价：请求**处理不保序**（帧按序读入、
+  回复按 id 关联）；push_event 保持内联派发以保事件投递顺序。插件侧
+  `PluginOps` 回调可能并发——与进程内插件一致，回调须线程安全；
 - 插件→框架：`HostCall`（能力回程，op 词汇同 wasm 宿主注入——含 `fs_read`/
   `fs_write`/`net_request`/`net_body_read`/`net_body_close`）+ `Subscribe`（帧内
   承载完整 `contract.EventFilter`）；

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,23 @@ import (
 type facesFS struct {
 	files   map[string][]byte
 	written map[string][]byte
+}
+
+func (f *facesFS) ReadDir(name string) ([]contract.DirEntry, error) {
+	prefix := name
+	if prefix == "." || prefix == "/" {
+		prefix = ""
+	} else {
+		prefix = strings.TrimSuffix(prefix, "/") + "/"
+	}
+	var out []contract.DirEntry
+	for k := range f.files {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, contract.DirEntry{Name: strings.TrimPrefix(k, prefix)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func (f *facesFS) ReadFile(name string) ([]byte, error) {
@@ -147,6 +165,18 @@ func TestFacesFSImports(t *testing.T) {
 	if string(out) != "world" {
 		t.Fatalf("fs_read = %q, want world", out)
 	}
+	// fs_readdir("."):一层条目 JSON 数组(信封解包后)。
+	dout, err := h.Call(context.Background(), "wasm.faces", "Dir", nil)
+	if err != nil {
+		t.Fatalf("call Dir: %v", err)
+	}
+	var entries []contract.DirEntry
+	if err := json.Unmarshal(dout, &entries); err != nil {
+		t.Fatalf("dir entries %s: %v", dout, err)
+	}
+	if len(entries) != 1 || entries[0].Name != "hello.txt" || entries[0].IsDir {
+		t.Fatalf("entries = %+v", entries)
+	}
 	// fs_write("out.txt","from-guest"):后端可见写入。
 	if _, err := h.Call(context.Background(), "wasm.faces", "Write", nil); err != nil {
 		t.Fatalf("call Write: %v", err)
@@ -226,13 +256,13 @@ func TestDeliveryLockBusySkips(t *testing.T) {
 	p := mustLoad(t) // demo 夹具:导出 egop_on_event / egop_on_hook
 	defer p.Close(context.Background())
 
-	p.mu.Lock()
+	p.insts[0].mu.Lock()
 	// 同一 goroutine 持锁重入(自发布死锁的最小形状):必须立即返回。
 	before := time.Now()
 	p.pushEvent(context.Background(), "wasm.test.topic", contract.Event{Type: "wasm.test.topic", Payload: json.RawMessage(`{"n":1}`)})
 	hr := p.invokeHook(context.Background(), "demo.hook", json.RawMessage(`{}`))
 	elapsed := time.Since(before)
-	p.mu.Unlock()
+	p.insts[0].mu.Unlock()
 
 	if elapsed > time.Second {
 		t.Fatalf("busy delivery took %v (want immediate TryLock skip)", elapsed)

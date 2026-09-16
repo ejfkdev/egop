@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -106,5 +107,76 @@ func TestDialStreamOverNetPipe(t *testing.T) {
 	out, err := h.Call(context.Background(), "pipe.out", "echo", json.RawMessage(`"ok"`))
 	if err != nil || string(out) != `"ok"` {
 		t.Fatalf("echo = %s, %v", out, err)
+	}
+}
+
+// TestSameSessionNestedSelfCall 同会话自调(旧 recvLoop 内联派发的死锁形状):
+// 插件处理框架调用期间经 HostCall 回程调用**自己**——嵌套请求帧必须有人读。
+// 内联派发时本处理阻塞等回复、读循环忙于本处理 → 永久死锁(测试超时);
+// 并发派发后嵌套请求照常读入处理,调用链成功。
+func TestSameSessionNestedSelfCall(t *testing.T) {
+	h := host.New[any](host.Options[any]{})
+	mf := contract.Manifest{
+		Meta: contract.Meta{
+			ID: "pipe.nested", Name: "N", Version: "1",
+			Provides: contract.Provides{
+				Capabilities: []string{contract.CapCallPlugins},
+				Functions:    []contract.FuncSpec{{Name: "outer"}, {Name: "inner"}},
+			},
+		},
+	}
+	var plugSess *Session
+	// channel 交接会话句柄:attach goroutine 写、主 goroutine 读——无数据竞争。
+	sessCh := make(chan *Session, 1)
+	ops := &PluginOps{
+		CallFunc: func(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+			if fname != "outer" {
+				return json.RawMessage(`"inner-ok"`), nil
+			}
+			// 回程经框架调用自己(同一会话):outer 的回复要等本函数返回,
+			// 而 inner 请求只能由本会话读循环读——并发派发是唯一活路。
+			out, err := plugSess.HostCall(ctx, OpCall, json.RawMessage(
+				`{"plugin_id":"pipe.nested","fname":"inner","input":{}}`))
+			if err != nil {
+				return nil, fmt.Errorf("nested host call: %w", err)
+			}
+			return out, nil
+		},
+	}
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	fwStream := BindStream(context.Background(), a)
+	plStream := BindStream(context.Background(), b)
+
+	go func() {
+		s, err := AttachStream(context.Background(), plStream, mf, ops)
+		if err != nil {
+			t.Errorf("attach: %v", err)
+			return
+		}
+		sessCh <- s
+	}()
+	go func() {
+		_ = ServeStream(context.Background(), h, fwStream, "", nil)
+	}()
+
+	select {
+	case plugSess = <-sessCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach timeout")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !h.HasPlugin("pipe.nested") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !h.HasPlugin("pipe.nested") {
+		t.Fatal("plugin never registered")
+	}
+
+	out, err := h.Call(context.Background(), "pipe.nested", "outer", json.RawMessage(`{}`))
+	if err != nil || string(out) != `"inner-ok"` {
+		t.Fatalf("nested self-call = %s, %v (want inner-ok)", out, err)
 	}
 }

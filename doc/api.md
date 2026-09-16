@@ -9,20 +9,22 @@
 ```go
 type Meta struct { ID, Name, Version, Description; Homepage, License string;
     Authors, Tags []string; Provides Provides; Requires Requires; Slot string;
-    DependsOn []string; Extensions map[string]json.RawMessage }  // Extensions=自由扩展键值(开发者自约定,egop 不解释)
+    Extensions map[string]json.RawMessage }  // Extensions=自由扩展键值(开发者自约定,egop 不解释;键勿用 "egop." 保留前缀)
 type Provides struct { Points, Capabilities []string; Hooks []HookPointSpec;
     Events []EventTopicSpec; Functions []FuncSpec; Config []ConfigFieldSpec }
 type Requires struct { Listens []string; Deps []Dependency; Tools []string }
 type Manifest struct { Meta; Tools []FuncSpec }
 type SlotSpec struct { ID, Doc; Provides, Hooks, Events, Functions, Capabilities, Config,
-    Listens, NeedsTools, Needs []string; Builtin bool }
+    Listens, NeedsTools, Needs []string; Builtin bool; Extensions map[string]json.RawMessage }
 type FuncSpec struct { Name, Description string; Input, Output json.RawMessage;
     Extensions map[string]json.RawMessage }  // Extensions=自由扩展键值(与 Meta.Extensions 同构)
-type HookPointSpec struct { ID string; Kind HookKind; Desc string; Payload, Result json.RawMessage }
-type EventTopicSpec struct { ID, Description string; Payload json.RawMessage }
+type HookPointSpec struct { ID string; Kind HookKind; Description string; Payload, Result json.RawMessage;
+    Extensions map[string]json.RawMessage }  // Kind=observe 的点回调 Block 无效(宿主按声明丢弃)
+type EventTopicSpec struct { ID, Description string; Payload json.RawMessage; Extensions map[string]json.RawMessage }
 type ConfigFieldSpec struct { Key, Description string; Schema, Default json.RawMessage;
-    Readable, Writable, Secret bool }
-type Dependency struct { Plugin, Slot string; Kind DependencyKind; MinVersion string }
+    Readable, Writable, Secret bool; Extensions map[string]json.RawMessage }  // Secret=声明优先脱敏(观察事件)
+type Dependency struct { Plugin, Slot string; Kind DependencyKind; MinVersion string;
+    Extensions map[string]json.RawMessage }  // Plugin/Slot 恰有其一(双空拒载;双取 Slot 优先)
 type ResultEnvelope struct { OK bool; Result json.RawMessage; ResultB64, Error, Type string; At int64; Meta json.RawMessage }
 type Event struct { Type, SubType string; Version int; Source *Origin; Payload json.RawMessage; Labels map[string]string }
 type EventFilter struct { Type, SubType string; SourceID, SourceVersion string; SourceKind OriginKind; Labels map[string]string }
@@ -31,7 +33,12 @@ type Net interface { Request(ctx, Request) (*Response, error); DialStream(ctx, u
 type Request struct { Method, URL string; Headers map[string]string; Body io.Reader }
 type Response struct { Status int; Headers, Trailers map[string]string; Body io.Reader }
 type Stream interface { Send([]byte) error; Recv() ([]byte, error); Context() context.Context }
-type FS interface { ReadFile(name string) ([]byte, error); WriteFile(name string, data []byte) error }  // 全局文件系统注入后端(范围/沙箱由实现定)
+type FileStore interface { Read(name string) ([]byte, error); Write(name string, data []byte) error;
+    Append(name string, data []byte) error; List() ([]string, error) }  // 插件专属文件(Write=整文件覆盖,Append=末尾追加)
+type KeyValue interface { Get(key string) ([]byte, bool); Put(key string, v []byte); Delete(key string); Keys() []string }
+type FS interface { ReadFile(name string) ([]byte, error); WriteFile(name string, data []byte) error;
+    ReadDir(name string) ([]DirEntry, error) }  // 全局文件系统注入后端(范围/沙箱由实现定;ReadDir 列一层)
+type DirEntry struct { Name string; IsDir bool; Size, ModTime int64 }  // ModTime=unix 毫秒,0 未知
 type Storage interface { File(pluginID string) FileStore; KV(pluginID string) KeyValue }
 type OriginKind string   // event | hook | call | host
 type Origin struct { ID, Version string; Kind OriginKind; Point string; At int64 }
@@ -86,10 +93,14 @@ func HasCapability(m Meta, cap string) bool
 func PointID(pluginID, pointID string) string   // "dyn.<plugin>.<point>"
 func EventID(pluginID, short string) string
 const DynamicPrefix = "dyn."
+const ReservedExtPrefix = "egop."               // Extensions 键保留前缀(egop 自身特性;自定义键勿用)
 const EventConfigUpdated = "plugin.config.updated"  // SetConfig 成功的观察事件主题
 const EventPluginRegistered = "plugin.registered"   // 插件注册(Register 成功后广播)
 const EventPluginRemoved    = "plugin.removed"      // 插件卸载(含级联 victim;软依赖方订阅降级)
 const EventPluginReplaced   = "plugin.replaced"     // 插件热替换(Replace 成功后广播)
+func IsFrameworkTopic(topic string) bool        // 框架保留主题判定(插件经 Surface 发布被拒)
+func Ext[T any](ext map[string]json.RawMessage, key string) (T, bool)  // Extensions 取值+解码(缺键/失败=零值,false)
+func CloneMeta(m Meta) Meta                      // 深拷贝(注册快照不变量:宿主入册即冻结)
 func WithOrigin(ctx context.Context, o *Origin) context.Context  // 注入调用来源(框架用)
 func OriginFrom(ctx context.Context) *Origin      // 被调函数读调用者(nil = 宿主/应用发起)
 ```
@@ -139,14 +150,14 @@ type Source = contract.Source
 **方法**
 
 ```go
-Register(p contract.Plugin) error                              // 单件注册(顺序敏感)
+Register(p contract.Plugin) error                              // 单件注册(顺序敏感;Meta 入册即 CloneMeta 快照)
 RegisterMany(plugs []contract.Plugin) RegisterReport           // 批量+拓扑排序+隔离
 RegisterLazy(p contract.Plugin) (RegisterStatus, error)         // 依赖未满足先入队,到位后自动补载
 // type RegisterStatus int // StatusRegistered | StatusPending
-Replace(p contract.Plugin) error                                 // 与 Register 同款契约校验(依赖/槽位),拒换保旧版
+Replace(p contract.Plugin) error                                 // 与 Register 同款契约校验(依赖/槽位),拒换保旧版;快照+配置回灌
 Remove(pluginID string, cascade bool) ([]string, error)          // 级联卸载 / fail-closed(点名与槽位依赖同判;victims 去重)
 Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error) // 含 schema 校验
-SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated(整对象替换)
+SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated(整对象替换;观察事件 Secret 声明优先脱敏)
 SetConfigField(pluginID, key string, value json.RawMessage) error // 单字段合并(再下发)
 SurfaceFor(pluginID string) (contract.Surface, bool)
 Close(ctx) error                                               // 逆注册序 + Disposer 清退
@@ -157,12 +168,16 @@ CapabilityIndex() map[string][]string                          // 能力词 → 
 Functions() []FnView                                            // 函数目录快照
 Tools() []Tool[C]                                               // 工具收集(声明 tool.provide)
 OnHook(hookID string, fn contract.HookFunc) func()             // 注册 hook 回调(返回撤销)
-TriggerHook(ctx, hookID string, data json.RawMessage) []contract.HookResult // 触发 hook
+TriggerHook(ctx, hookID string, data json.RawMessage) []contract.HookResult // 触发 hook;observe 点按声明丢弃 Block
 AppliedConfig(pluginID string) (json.RawMessage, bool)          // 宿主推过的缓存
 EffectiveConfig(pluginID string) (json.RawMessage, bool)        // 权威读回:ConfigProvider 优先,回退 applied
 GetConfig(pluginID, key string) (json.RawMessage, bool)         // 读 EffectiveConfig 的单个字段
 Snapshot() Snapshot                                            // {plugins,functions,capabilities,applied_config}
 ```
+
+注册期校验(注册/替换口共用,fail-closed):插件 id 与函数名拒绝空白/控制字符,
+**函数名另拒 `"."**(函数目录键 `id.fn` 的分隔符);依赖项 `Plugin`/`Slot` 双空拒载;
+插件经 Surface 发布框架保留主题(`plugin.*` 生命周期/`plugin.config.updated`)被拒发并留痕。
 
 ```go
 type RegisterReport struct { Registered []string; Pending []string; Failed []RegisterFailure }
@@ -191,8 +206,9 @@ func LoadFile(ctx, path string, opts Options) (*Plugin, error)      // 单文件
 func LoadFS(ctx, data []byte, name string, opts Options) (*Plugin, error)  // 直接字节
 func ScanFS(ctx, fsys fs.FS, opts Options) ([]*Plugin, []error)     // fs.FS 遍历
 func ScanDir(ctx, dir string, opts Options) ([]*Plugin, []error)    // = ScanFS(os.DirFS(dir))
+const MaxFSReadBytes = 8 << 20   // fs_read 单次回传 guest 的 ABI 尺寸护栏(信封 base64 放大前拒)
 
-type Plugin struct{ /* Meta/CallFunc/ApplyConfig/SetSurface/ToolSpecs/ToolRaw/Close */ }
+type Plugin struct{ /* Meta/CallFunc/ApplyConfig/Config/SetSurface/ToolSpecs/ToolRaw/Close */ }
 func (p *Plugin) ToolRaw(name) (func(ctx, tctxJSON, args json.RawMessage) (string, error), bool)
 func (p *Plugin) Assets() map[string][]byte   // zip 内 assets/ 静态资源表副本(裸 wasm = 空表)
 ```
@@ -200,6 +216,18 @@ func (p *Plugin) Assets() map[string][]byte   // zip 内 assets/ 静态资源表
 zip 包缺 `plugin.wasm` = **无代码插件**(纯清单/资产):可加载、可注册,声明
 函数/工具/配置/hook 点等需代码兑现的面即拒载;`CallFunc`/`ApplyConfig` 返回
 干净错误(非 panic)。
+
+实例语义(机制内建,见 contract.md §8"实例池与自愈"):
+
+- **实例池**:清单扩展 `egop.pool` 声明并发池(缺省 1、上限 4,zip 与裸 wasm
+  都生效);入口 TryLock 空闲实例,同调用栈嵌套(经 ctx 重入标记识别)池耗尽
+  立即返回 busy;事件/hook 观察面钉主实例(不随池放大)。
+- **活体工具面**:`ToolSpecs` 优先调 guest 的 `egop_tool_specs` 导出(动态工具
+  如 MCP 运行期发现),无导出/失败/断后回落 `Manifest.Tools` 静态清单。
+- **revive**:调用被 ctx 取消/trap 打断的实例,下次调用自动重建(复用编译产物、
+  重放 `egop_init` 与最近配置);显式 `Close` 是终态不复活。
+- **系统时钟**:`_initialize`/`_start` 之外,实例化接 WithSysWalltime/Nanotime/
+  Nanosleep(guest 的 time.Now/Sleep 是真钟——wazero 缺省是假钟桩)。
 
 ## loader/remote
 
@@ -225,9 +253,10 @@ type Session struct{ /* Register/CallFunc/Tool/Hook/ApplyConfig/HostCall/Subscri
 ```
 
 op 词汇（`HostCall` 能力回程，与 wasm 宿主注入同构）：`call / get_setting /
-persist_read / persist_write / persist_list / kv_get / kv_put / kv_delete / kv_keys /
-exec / on_hook / publish_event / plugins / get_plugin / get_config / set_config /
-fs_read / fs_write / net_request / net_body_read / net_body_close`，其余 op 经
+persist_read / persist_write / persist_append / persist_list / kv_get / kv_put /
+kv_delete / kv_keys / exec / on_hook / publish_event / plugins / get_plugin /
+get_config / set_config / fs_read / fs_readdir / fs_write / net_request /
+net_body_read / net_body_close`，其余 op 经
 `Surface.Op` 透传。事件/过滤统一：`publish_event` 载荷是完整 `contract.Event`
 JSON，`subscribe` 帧载荷是完整 `contract.EventFilter`。`call_func` / `hook` 帧带
 `origin` 字段（调用/触发来源随帧上线，插件侧还原进处理 ctx；加性演进，旧对端
@@ -246,7 +275,11 @@ func (w *Watcher) Unload(ctx)   // 反注册+关闭全部已加载插件(mount �
 ```
 
 增/改/**删**都是两段确认：内容连续两轮一致才装载，文件连续两轮未见才卸载——
-目录瞬态读失败、文件系统抖动不误卸已加载插件。
+目录瞬态读失败、文件系统抖动不误卸已加载插件。**失败重试分层**：内容坏件
+(LoadFS 失败/契约拒载)记 errHash——hash 未变不重试(等真变化,重新两段确认
+再试);注册瞬态失败(依赖未就位)保留已装载实例,后续轮次**只重试 Register**
+(不重编译,依赖到位后注册的正是保留实例)。mount 首装把 Failed 也算进展,
+拍至稳定或 maxInitRounds=64 上限。
 
 ## mount（一站式装配）
 
@@ -267,7 +300,10 @@ func CheckDirs(ctx, dirs []string) []error   // 离线校验
 
 装配失败时句柄自行**全清**：停 watcher/会话/入站流，并反注册+关闭目录阶段已
 进册的插件（`Watcher.Unload`），宿主回到装配前状态；正常关停不做反注册——
-注册面归宿主总闸（`Host.Close`）。
+注册面归宿主总闸（`Host.Close`）。Close join accept/ServeStream goroutine
+(先关流/取消再等,不留迟到注册窗口)。远程会话的入站请求**并发派发**(有界
+32/会话):慢 op 不队头阻塞、同会话自调不死锁;请求处理不保序、插件侧
+PluginOps 回调可能并发(与进程内插件一致,须线程安全)。
 
 ## schema（JSON Schema 子集）
 

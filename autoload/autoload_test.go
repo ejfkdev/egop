@@ -300,3 +300,77 @@ func TestUnloadUnregistersAndCloses(t *testing.T) {
 	// 幂等:再调是空操作。
 	w.Unload(context.Background())
 }
+
+// TestFailedContentNotRetriedUntilChange 内容坏件(非依赖问题)不再每轮重编译:
+// 同一 hash 只试一次;内容变化后重新两段确认再试一次。
+func TestFailedContentNotRetriedUntilChange(t *testing.T) {
+	h := coreHost(t)
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.egop.wasm")
+	if err := os.WriteFile(bad, []byte("not-wasm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := New(h, []string{dir}, Options{})
+	// 前三轮:两段确认 + 一次装载尝试 → 恰一条 ActionFailed。
+	evs := settle(t, w, 3)
+	if n := countFailed(evs); n != 1 {
+		t.Fatalf("rounds 1-3: failed events = %d (want 1), evs=%v", n, evs)
+	}
+	// 后续多轮:hash 未变 → 不再重试(无新事件、不重编译)。
+	if evs := settle(t, w, 5); len(evs) != 0 {
+		t.Fatalf("unchanged bad content must not retry, evs=%v", evs)
+	}
+	// 内容变化(仍是坏件):重新两段确认后再试一次。
+	if err := os.WriteFile(bad, []byte("still-not-wasm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	evs = settle(t, w, 4)
+	if n := countFailed(evs); n != 1 {
+		t.Fatalf("after change: failed events = %d (want 1), evs=%v", n, evs)
+	}
+}
+
+func countFailed(evs []Event) int {
+	n := 0
+	for _, e := range evs {
+		if e.Action == ActionFailed {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRegisterFailureKeepsInstance 依赖未就位:装载成功、注册失败——实例保留
+// (np),后续轮次只重试 Register(同一实例指针,不重新 LoadFS);依赖到位后
+// 注册成功的正是保留的实例。
+func TestRegisterFailureKeepsInstance(t *testing.T) {
+	h := coreHost(t)
+	dir := t.TempDir()
+	writeZip(t, dir, "b.egop.zip",
+		`{"id":"wasm.b","name":"B","version":"1","requires":{"deps":[{"plugin":"wasm.a","kind":"init"}]}}`,
+		demoModule(t))
+	w := New(h, []string{dir}, Options{})
+	settle(t, w, 4)
+	key := filepath.Join(dir, "b.egop.zip")
+	u := w.units[key]
+	if u == nil || u.np == nil {
+		t.Fatalf("failed register must keep the loaded instance for Register-only retry, u=%+v", u)
+	}
+	np := u.np
+	// 再来几轮:仍是同一实例(不重新装载)。
+	settle(t, w, 3)
+	if u.np != np {
+		t.Fatal("kept instance must not be recreated across polls")
+	}
+	// 依赖落地 → 注册成功,且就是保留的实例。
+	writeZip(t, dir, "a.egop.zip", `{"id":"wasm.a","name":"A","version":"1"}`, demoModule(t))
+	settle(t, w, 8)
+	if !h.HasPlugin("wasm.b") {
+		t.Fatalf("B must register after dependency arrives, plugins=%v", h.Plugins())
+	}
+	if u.plugin != np || u.np != nil {
+		t.Fatal("registered instance must be the kept np (no reload)")
+	}
+	w.Stop()
+	w.Unload(context.Background())
+}

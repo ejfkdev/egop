@@ -28,6 +28,15 @@ examples  ← 可跑示例,禁止示例里引入业务假设
 禁止:contract→host、host→loader/remote、任何包→业务域、循环 import。改层间
 依赖后必须 `make hygiene`(分层破坏往往仍能编译,靠全量测试与审视兜底)。
 
+大包内文件组织(职责拆分,纯便利非层级):host = host.go(结构/构造/关停/控制面
+查询)+ register.go(注册/契约校验/槽位/Remove/Replace)+ call.go(调用/配置链/
+工具/hook 触发)+ surface.go(plugSurface 能力视图);contract = contract.go(信封/
+事件/框架主题)+ meta.go(清单词汇/Extensions/CloneMeta)+ surface.go(插件接口族/
+注入后端面);loader/wasm = load.go(装载解析)+ plugin.go(Plugin 接口实现)+
+pool.go(实例池/配额)+ delivery.go(事件/hook 投递)+ revive.go(打断自愈)+
+abi.go(ABI 词汇与宿主注入表)。新增代码先对号入座;拆分移动不改行为。
+
+
 ## 不变量(JSON 契约与机制语义)
 
 - **唯一编码**:跨边界全程 JSON。WASM ABI 与远程通道帧(loader/remote)的结果信封同构
@@ -51,12 +60,27 @@ examples  ← 可跑示例,禁止示例里引入业务假设
 - **SubscribeEvent 回调带 topic**:`func(ctx, topic string, e Event) func()`。
 - **事件/hook 投递不重入取锁**:总线同步扇出可能在"guest 自己正持实例锁调用中"
   的同一 goroutine 上重入投递(插件发布命中自身订阅的事件)——wasm 侧
-  `pushEvent`/`invokeHook` 一律 `TryLock`,锁忙即跳过本次投递(事件丢弃/hook 记
-  Reason,best-effort),绝不阻塞取锁(对非重入锁自死锁,有 selfpub 夹具测试固化)。
+  `pushEvent`/`invokeHook` 一律非阻塞锁定**主实例**(`tryAcquirePrimary`,观察面
+  钉 insts[0]:订阅/hook 注册也只挂主实例,池>1 不放大),忙即跳过本次投递
+  (事件丢弃/hook 记 Reason,best-effort),绝不阻塞(对非重入锁自死锁,有
+  selfpub 夹具测试固化)。**调用链**上的嵌套重入经 ctx 重入标记识别:取第二
+  实例,池耗尽立即 busy 回落,绝不等待(决策 #21)。
+- **宿主持 h.mu 期间绝不调插件代码**(ToolSpecs/Tool/CallFunc/ApplyConfig 等):
+  插件代码可能回查宿主(`plugins`/`call` 注入都取 h.mu),同 goroutine 即死锁且
+  看门狗无解(停在 mutex 上的 Go 代码打不断)。收集类操作锁内只取快照、锁外调
+  插件。
+- **remote 入站请求并发派发**:session.recvLoop 只内联回复路由/subscribe/ping/
+  push_event(事件保序),请求帧派发到带界 goroutine(32/会话,满则回 busy)——
+  慢 op 不队头阻塞、同会话自调不死锁;插件侧回调可并发,勿引入"依赖处理顺序"的
+  隐含假设。
+- **wasm 生命周期字段竞争**:p.compiled/p.lastCfg 读写一律经 poolMu 快照
+  (Close/ApplyConfig 写同锁),instantiateOne 显式收 compiled 参数;surface 走
+  原子指针 surf()。勿绕过这些缝直取字段。
 - **热更两段确认**:增/改连续两轮 hash 一致才应用(抗半截写),**删连续两轮未见
-  才卸载**(抗目录瞬态读失败误卸);替换失败必须回退保旧版,且 `Replace` 过与
-  `Register` 同款契约校验(DepInit 依赖/槽位八轴)——替换口不得比注册口宽松。
-  这些语义有测试固化,勿"顺手简化"。
+  才卸载**(抗目录瞬态读失败误卸);**失败件保留观察槽跨轮重试**(依赖链乱序时
+  先失败件自动补载,mount 把 Failed 也算进展);替换失败必须回退保旧版,且
+  `Replace` 过与 `Register` 同款契约校验(DepInit 依赖/槽位八轴)——替换口不得
+  比注册口宽松。这些语义有测试固化,勿"顺手简化"。
 - **关停语义**:`Host.Close` 逆注册序 + Disposer 清退;Remove(cascade=false)
   被依赖时 fail-closed——点名依赖与**槽位依赖**同判(按"删除后槽位是否仍有其它
   供给"精确判定,槽位名与插件 id 是两个命名空间,勿直接相等比较);级联 victims
@@ -64,6 +88,21 @@ examples  ← 可跑示例,禁止示例里引入业务假设
 - **批量装载**:`host.RegisterMany` 按 `Requires`(DepInit,Plugin/Slot) 拓扑排序
   后依序注册,失败隔离(缺依赖/成环/重复 id 单独失败);`mount` 首装拍至稳定、
   `autoload` 依赖后到自动补载——均有测试固化,勿回退成固定次数/固定顺序。
+- **Meta 注册快照**:Register/Replace 入册即 `contract.CloneMeta` 深拷贝(全部
+  slice/map/RawMessage)——宿主目录/校验/控制面与插件侧 Meta 互不影响;勿在宿主
+  里存未克隆的 Meta 引用。函数名禁 `"."` 与空白(fns 键 `id.fn` 分隔符),插件 id
+  拒空白/控制字符但**允许含点**(vendor.name 惯例);依赖项 Plugin/Slot 双空拒载。
+- **扩展键值与保留前缀**:全部声明结构(Meta/FuncSpec/Hook/Event/Config/Dependency/
+  SlotSpec)带同构 `Extensions map[string]json.RawMessage`,egop 不解释;键前缀
+  `egop.`(ReservedExtPrefix)保留给 egop 自身特性(在用 egop.pool),自定义键勿用。
+- **框架主题保留**:`plugin.*` 生命周期与 `plugin.config.updated` 是宿主专署广播,
+  插件经 Surface 发布一律拒发留痕(contract.IsFrameworkTopic 单点判定)——防伪造
+  生命周期事件。`Provides.Events/Points/Listens` 保持描述性(发现/槽位轴),不做
+  运行时逐主题强制。
+- **声明优先的语义接线**:声明面不得有"零消费"词汇——`ConfigFieldSpec.Secret`
+  进观察事件脱敏(声明优先、键名启发兜底),`HookPointSpec.Kind=observe` 的回调
+  Block 由 TriggerHook 按声明丢弃(声明表 hookDecls 注册/替换/删除后全量重建);
+  新增声明字段必须同步接线或明确注释为纯描述,勿留死词(曾因此删 DependsOn)。
 
 ## 命令与工具链
 

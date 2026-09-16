@@ -4,6 +4,8 @@ package host
 
 import (
 	"os"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/ejfkdev/egop/contract"
@@ -21,6 +23,23 @@ func (f *fakeFS) ReadFile(name string) ([]byte, error) {
 		return nil, os.ErrNotExist
 	}
 	return b, nil
+}
+
+func (f *fakeFS) ReadDir(name string) ([]contract.DirEntry, error) {
+	prefix := name
+	if prefix == "." || prefix == "/" {
+		prefix = ""
+	} else {
+		prefix = strings.TrimSuffix(prefix, "/") + "/"
+	}
+	var out []contract.DirEntry
+	for k := range f.files {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, contract.DirEntry{Name: strings.TrimPrefix(k, prefix)})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 func (f *fakeFS) WriteFile(name string, data []byte) error {

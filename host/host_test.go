@@ -511,6 +511,15 @@ func (f *memFile) Write(name string, data []byte) error {
 	f.s.files[f.id][name] = data
 	return nil
 }
+func (f *memFile) Append(name string, data []byte) error {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	if f.s.files[f.id] == nil {
+		f.s.files[f.id] = map[string][]byte{}
+	}
+	f.s.files[f.id][name] = append(f.s.files[f.id][name], data...)
+	return nil
+}
 func (f *memFile) List() ([]string, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
@@ -735,6 +744,45 @@ func TestSetConfigDetectsConcurrentReplace(t *testing.T) {
 	}
 	if err := h.SetConfig("cfg.repl", json.RawMessage(`{"k":"v"}`)); err == nil {
 		t.Fatal("SetConfig should detect the target was replaced during apply")
+	}
+}
+
+// recConf 记录 ApplyConfig 收到的配置(替换回灌断言用)。
+type recConf struct {
+	meta contract.Meta
+	got  []string
+}
+
+func (r *recConf) Meta() contract.Meta { return r.meta }
+func (r *recConf) ApplyConfig(cfg json.RawMessage) error {
+	r.got = append(r.got, string(cfg))
+	return nil
+}
+
+// TestReplaceReappliesConfig 替换件必须继承 applied 配置(宿主侧状态回灌):
+// 否则热更静默丢已配置行为(审批开关回落默认关=fail-open 类事故)。
+func TestReplaceReappliesConfig(t *testing.T) {
+	h := New[any](Options[any]{})
+	mk := func(v string) contract.Meta {
+		return contract.Meta{ID: "cfg.reapply", Name: "C", Version: v,
+			Provides: contract.Provides{Config: []contract.ConfigFieldSpec{{Key: "k"}}}}
+	}
+	p1 := &recConf{meta: mk("1")}
+	if err := h.Register(p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.SetConfig("cfg.reapply", json.RawMessage(`{"k":"v1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	p2 := &recConf{meta: mk("2")}
+	if err := h.Replace(p2); err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.got) != 1 || p2.got[0] != `{"k":"v1"}` {
+		t.Fatalf("replaced instance must inherit applied config, got %v", p2.got)
+	}
+	if len(p1.got) != 1 {
+		t.Fatalf("old instance must not be touched again: %v", p1.got)
 	}
 }
 

@@ -3,6 +3,7 @@
 ;; (fname,in,origin 三个字符串对),按 fname 首字节路由:
 ;;   'O' → 把第三参 origin JSON 包进 {"ok":true,"result":<origin>} 信封回显
 ;;         (scratch 2200 三段拼接,验证溯源跨 ABI 透传);
+;;   'D' → fs_readdir(".") 信封透传;
 ;;   'R' → fs_read("hello.txt") 信封原样透传;
 ;;   'W' → fs_write("out.txt","from-guest") 信封透传;
 ;;   'N' → net_request(静态 GET https://svc/data)信封透传;
@@ -11,6 +12,7 @@
 ;;   其余 → 静态 {"ok":true}。
 (module
   (import "egop" "fs_read" (func $fs_read (param i32 i32) (result i64)))
+  (import "egop" "fs_readdir" (func $fs_readdir (param i32 i32) (result i64)))
   (import "egop" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i64)))
   (import "egop" "net_request" (func $net_request (param i32 i32) (result i64)))
   (import "egop" "net_body_read" (func $net_body_read (param i32 i32) (result i64)))
@@ -29,7 +31,7 @@
   (func (export "egop_meta") (result i64)
     i32.const 1024
     i64.extend_i32_u
-    i64.const 229
+    i64.const 244
     i64.const 32
     i64.shl
     i64.or)
@@ -79,6 +81,16 @@
       i64.const 32
       i64.shl
       i64.or
+      return
+    end
+    ;; 'D' = fs_readdir(".")
+    local.get $c
+    i32.const 68
+    i32.eq
+    if
+      i32.const 2740
+      i32.const 1
+      call $fs_readdir
       return
     end
     ;; 'R' = fs_read("hello.txt")
@@ -139,11 +151,12 @@
     i64.const 32
     i64.shl
     i64.or)
-  (data (i32.const 1024) "{\"id\":\"wasm.faces\",\"name\":\"Faces\",\"version\":\"1.0.0\",\"provides\":{\"capabilities\":[\"fs.read\",\"fs.write\",\"net.access\"],\"functions\":[{\"name\":\"Origin\"},{\"name\":\"Read\"},{\"name\":\"Write\"},{\"name\":\"Net\"},{\"name\":\"Body\"},{\"name\":\"Close\"}]}}")
+  (data (i32.const 1024) "{\"id\":\"wasm.faces\",\"name\":\"Faces\",\"version\":\"1.0.0\",\"provides\":{\"capabilities\":[\"fs.read\",\"fs.write\",\"net.access\"],\"functions\":[{\"name\":\"Origin\"},{\"name\":\"Read\"},{\"name\":\"Write\"},{\"name\":\"Net\"},{\"name\":\"Body\"},{\"name\":\"Close\"},{\"name\":\"Dir\"}]}}")
   (data (i32.const 2048) "{\"ok\":true,\"result\":")
   (data (i32.const 2100) "{\"ok\":true}")
   (data (i32.const 2600) "hello.txt")
   (data (i32.const 2620) "out.txt")
   (data (i32.const 2640) "from-guest")
   (data (i32.const 2660) "{\"method\":\"GET\",\"url\":\"https://svc/data\"}")
-  (data (i32.const 2720) "1"))
+  (data (i32.const 2720) "1")
+  (data (i32.const 2740) "."))

@@ -62,6 +62,12 @@ func (f *memFile) Write(name string, data []byte) error {
 	f.s.files[f.id][name] = data
 	return nil
 }
+func (f *memFile) Append(name string, data []byte) error {
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+	f.s.files[f.id][name] = append(f.s.files[f.id][name], data...)
+	return nil
+}
 func (f *memFile) List() ([]string, error) {
 	f.s.mu.Lock()
 	defer f.s.mu.Unlock()
@@ -113,7 +119,7 @@ func (k *keeper) Meta() contract.Meta {
 		ID: "demo.keeper", Name: "Keeper", Version: "1",
 		Provides: contract.Provides{
 			Capabilities: []string{contract.CapPersist, contract.CapKV},
-			Functions:    []contract.FuncSpec{{Name: "save"}, {Name: "load"}, {Name: "list"}},
+			Functions:    []contract.FuncSpec{{Name: "save"}, {Name: "load"}, {Name: "append"}, {Name: "list"}},
 		},
 	}
 }
@@ -139,6 +145,16 @@ func (k *keeper) CallFunc(_ context.Context, fname string, input json.RawMessage
 		fileVal, _ := fs.Read(v.Name)
 		kvVal, _ := kv.Get(v.Name)
 		return json.Marshal(map[string]string{"file": string(fileVal), "kv": string(kvVal)})
+	case "append":
+		var v struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		_ = json.Unmarshal(input, &v)
+		// 末尾追加(append-only 日志/事实账真源);Write 是整文件覆盖,拿它追加
+		// 等于每次截断只留末行——两个语义分开正是 FileStore.Append 的存在理由。
+		_ = fs.Append(v.Name, []byte(v.Value))
+		return json.RawMessage(`{"appended":true}`), nil
 	case "list":
 		files, _ := fs.List()
 		keys := kv.Keys()
@@ -179,6 +195,12 @@ func main() {
 	log.Printf("keeper.load() = %s", out)
 	out, _ = h.Call(ctx, "demo.keeper", "list", json.RawMessage(`{}`))
 	log.Printf("keeper.list() = %s", out)
+
+	// Append 语义演示:两次追加后两行都在(Write 则每次整文件覆盖只剩末行)。
+	_, _ = h.Call(ctx, "demo.keeper", "append", json.RawMessage(`{"name":"log","value":"line1\n"}`))
+	_, _ = h.Call(ctx, "demo.keeper", "append", json.RawMessage(`{"name":"log","value":"line2\n"}`))
+	out, _ = h.Call(ctx, "demo.keeper", "load", json.RawMessage(`{"name":"log"}`))
+	log.Printf("keeper.load(log) = %s (append 追加不截断)", out)
 
 	bout, _ := h.Call(ctx, "demo.blind", "probe", json.RawMessage(`{}`))
 	log.Printf("blind.probe() = %s (未声明 → Persist/KV 不可用)", bout)
