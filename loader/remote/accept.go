@@ -16,6 +16,9 @@ import (
 type DialOptions struct {
 	// WantID 非空时校验插件清单 id(防连错服务)。
 	WantID string
+	// DispatchConcurrency 覆盖本会话入站请求并发派发上限(热点插件按需调大/
+	// 受控调小;0 = 默认 DefaultDispatchConcurrency)。
+	DispatchConcurrency int
 }
 
 func streamReplyErr(stream Stream, id uint64, msg string) error {
@@ -29,12 +32,19 @@ func streamReplyErr(stream Stream, id uint64, msg string) error {
 type AttachOption func(*attachConfig)
 
 type attachConfig struct {
-	token string
+	token   string
+	dispCon int
 }
 
 // WithToken 设置帧级握手口令:框架侧 ServeStream 以同 token 校验;空 = 双方都不校验。
 func WithToken(token string) AttachOption {
 	return func(c *attachConfig) { c.token = token }
+}
+
+// WithDispatchConcurrency 覆盖本会话入站请求并发派发上限(热点插件按需调大/
+// 受控调小;0 = 默认 DefaultDispatchConcurrency)。
+func WithDispatchConcurrency(n int) AttachOption {
+	return func(c *attachConfig) { c.dispCon = n }
 }
 
 // AttachStream 是插件侧的传输无关握手:在既有 Stream 上先发 Register(manifest),
@@ -46,6 +56,7 @@ func AttachStream(ctx context.Context, stream Stream, mf contract.Manifest, ops 
 		o(&cfg)
 	}
 	sess := NewSession(stream)
+	sess.SetDispatchConcurrency(cfg.dispCon)
 	if ops == nil {
 		ops = &PluginOps{}
 	}
@@ -75,6 +86,7 @@ func AttachStream(ctx context.Context, stream Stream, mf contract.Manifest, ops 
 // 插件以 Register(manifest=最终清单) 回执,返回未进册的 Adapter 与会话。
 func DialStream(ctx context.Context, rh RemoteHost, stream Stream, opts DialOptions) (*Adapter, *Session, error) {
 	sess := NewSession(stream)
+	sess.SetDispatchConcurrency(opts.DispatchConcurrency)
 	sess.Start()
 	reply, err := sess.Register(ctx, json.RawMessage("null"), "")
 	if err != nil {
@@ -110,7 +122,7 @@ func DialStream(ctx context.Context, rh RemoteHost, stream Stream, opts DialOpti
 
 // ServePluginStream 是插件侧作为**被拨入方**(出站方向)的传输无关握手:收框架
 // 先发的 Register(manifest 空),以 Register(manifest=最终清单) 回执,驱动会话。
-func ServePluginStream(ctx context.Context, stream Stream, mf contract.Manifest, ops *PluginOps) error {
+func ServePluginStream(ctx context.Context, stream Stream, mf contract.Manifest, ops *PluginOps, opts ...AttachOption) error {
 	f, err := recvFrame(stream)
 	if err != nil {
 		return err
@@ -119,10 +131,15 @@ func ServePluginStream(ctx context.Context, stream Stream, mf contract.Manifest,
 		_ = streamReplyErr(stream, f.Id, "remote: first frame must be Register")
 		return nil
 	}
+	var cfg attachConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	if ops == nil {
 		ops = &PluginOps{}
 	}
 	sess := NewSession(stream)
+	sess.SetDispatchConcurrency(cfg.dispCon)
 	sess.SetPeer(&pluginPeer{ops: ops})
 	if ops.PushEvent != nil {
 		sess.SetPushHandler(ops.PushEvent)

@@ -48,9 +48,13 @@ func (UnimplementedPeer) HandleHostCall(context.Context, string, json.RawMessage
 func (UnimplementedPeer) HandleSubscribe(context.Context, *contract.EventFilter) {}
 func (UnimplementedPeer) HandleShutdown(string)                                  {}
 
-// dispatchConcurrency 是单会话入站请求的并发派发上限(防 goroutine 无界;
-// 超额回执 busy 给对端,背压而非阻塞读循环)。
-const dispatchConcurrency = 32
+// DefaultDispatchConcurrency 是单会话入站请求并发派发上限的默认值:
+// 防 goroutine 无界(对端不可信,可廉价灌请求帧;无上界=无界 goroutine/内存),
+// 超额回执 busy 给对端,背压而非阻塞读循环。量级取"合法高并发(慢处理器)
+// 永远碰不到、只有病态洪水才碰"——1024 个阻塞 goroutine 约几 MB,可承受。
+// 热点插件可按需调小/调大(DialOptions / WithDispatchConcurrency /
+// mount RemoteSpec.dispatch_concurrency)。
+const DefaultDispatchConcurrency = 1024
 
 // Session 是单条流的双向复用引擎。
 type Session struct {
@@ -73,12 +77,21 @@ func NewSession(stream Stream) *Session {
 		stream:  stream,
 		pending: map[uint64]chan *Frame{},
 		done:    make(chan struct{}),
-		dispSem: make(chan struct{}, dispatchConcurrency),
+		dispSem: make(chan struct{}, DefaultDispatchConcurrency),
 	}
 }
 
 // SetPeer 设置对端语义(握手完成前为 nil)。
 func (s *Session) SetPeer(p Peer) { s.peer.Store(&p) }
+
+// SetDispatchConcurrency 覆盖入站请求并发派发上限(**须在 Start 前调用**;
+// n<=0 = 保持默认 DefaultDispatchConcurrency)。热点远程插件(慢处理器+
+// 高并发调用方)按需调大;受控环境可调小。
+func (s *Session) SetDispatchConcurrency(n int) {
+	if n > 0 {
+		s.dispSem = make(chan struct{}, n)
+	}
+}
 
 // SetPushHandler 设置事件推送投递口(插件侧)。
 func (s *Session) SetPushHandler(fn func(ctx context.Context, topic string, e contract.Event)) {

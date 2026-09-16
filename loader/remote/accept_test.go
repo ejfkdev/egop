@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +179,80 @@ func TestSameSessionNestedSelfCall(t *testing.T) {
 	out, err := h.Call(context.Background(), "pipe.nested", "outer", json.RawMessage(`{}`))
 	if err != nil || string(out) != `"inner-ok"` {
 		t.Fatalf("nested self-call = %s, %v (want inner-ok)", out, err)
+	}
+}
+
+// TestDispatchConcurrencyLimit 派发配额语义:配额被慢处理器占满时,后续并发
+// 请求**立即**回执 busy(不排队不等待);配额释放后新调用照常成功。默认值
+// 1024 只有病态洪水才碰(见 DefaultDispatchConcurrency 注释)。
+func TestDispatchConcurrencyLimit(t *testing.T) {
+	h := host.New[any](host.Options[any]{})
+	mf := contract.Manifest{
+		Meta: contract.Meta{
+			ID: "pipe.lim", Name: "L", Version: "1",
+			Provides: contract.Provides{Functions: []contract.FuncSpec{{Name: "slow"}}},
+		},
+	}
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ops := &PluginOps{
+		CallFunc: func(ctx context.Context, fname string, input json.RawMessage) (json.RawMessage, error) {
+			entered <- struct{}{} // 已进入 handler:配额被占的确定性观测点
+			<-release
+			return json.RawMessage(`"done"`), nil
+		},
+	}
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	fwStream := BindStream(context.Background(), a)
+	plStream := BindStream(context.Background(), b)
+
+	go func() {
+		_ = ServePluginStream(context.Background(), plStream, mf, ops, WithDispatchConcurrency(1))
+	}()
+	adapter, sess, err := DialStream(context.Background(), h, fwStream, DialOptions{
+		WantID: "pipe.lim", DispatchConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sess.Close()
+	if err := h.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一个慢调用(进入 handler 后占住唯一配额)。
+	first := make(chan error, 1)
+	go func() {
+		_, err := h.Call(context.Background(), "pipe.lim", "slow", json.RawMessage(`{}`))
+		first <- err
+	}()
+	<-entered
+
+	// 第二个并发调用:配额满 → 立即 busy 错误,绝不等待。
+	second := make(chan error, 1)
+	go func() {
+		_, err := h.Call(context.Background(), "pipe.lim", "slow", json.RawMessage(`{}`))
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		if err == nil || !strings.Contains(err.Error(), "busy") {
+			t.Fatalf("second concurrent call must fail busy, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second call waited instead of failing busy")
+	}
+
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	// 配额已释放:新调用照常成功。
+	out, err := h.Call(context.Background(), "pipe.lim", "slow", json.RawMessage(`{}`))
+	if err != nil || string(out) != `"done"` {
+		t.Fatalf("after release = %s, %v", out, err)
 	}
 }

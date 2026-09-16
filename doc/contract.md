@@ -404,10 +404,13 @@ type Dependency struct {
 `subscribe` / `push_event` / `shutdown` / `ping`。
 
 - 请求/回复按 `id` 关联；单向帧（push_event / shutdown）`id=0`；
-- **入站请求并发派发**（有界 32/会话）：一个慢 op 不再队头阻塞整条会话、
-  同会话自调不再死锁；超额回执 busy 背压。代价：请求**处理不保序**（帧按序读入、
-  回复按 id 关联）；push_event 保持内联派发以保事件投递顺序。插件侧
-  `PluginOps` 回调可能并发——与进程内插件一致，回调须线程安全；
+- **入站请求并发派发**（上限默认 `remote.DefaultDispatchConcurrency`=1024/会话,
+  经 `DialOptions`/`WithDispatchConcurrency`/mount `RemoteSpec.dispatch_concurrency`
+  按需覆盖）：一个慢 op 不再队头阻塞整条会话、同会话自调不再死锁；超额回执
+  busy 背压（立即错误,不排队——量级取"合法高并发永远碰不到、只有对端病态
+  洪水才碰"）。代价：请求**处理不保序**（帧按序读入、回复按 id 关联）；
+  push_event 保持内联派发以保事件投递顺序。插件侧 `PluginOps` 回调可能并发
+  ——与进程内插件一致，回调须线程安全；
 - 插件→框架：`HostCall`（能力回程，op 词汇同 wasm 宿主注入——含 `fs_read`/
   `fs_write`/`net_request`/`net_body_read`/`net_body_close`）+ `Subscribe`（帧内
   承载完整 `contract.EventFilter`）；

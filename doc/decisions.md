@@ -211,8 +211,11 @@ zip-only 装配实锤下 subagents 永不落载)。mount 首装把 ActionFailed 
 recvLoop 曾把入站请求帧(CallFunc/Tool/Hook/ApplyConfig/HostCall)**内联同步**处理:
 一个慢 op 队头阻塞整条会话(其它请求的回复路由、事件推送全部排队),同会话自调
 (插件经 HostCall 回程调回自己)更是永久死锁——嵌套请求帧只有这条忙着的读循环能读。
-裁决:请求类帧派发到**带界工作 goroutine**(每会话 32 配额,满即回执 busy 背压,
-绝不阻塞读循环);回复路由、Subscribe/Ping、push_event 保持内联(事件投递保序,
+裁决:请求类帧派发到**带界工作 goroutine**(配额制,满即回执 busy 背压,
+绝不阻塞读循环;上限默认 `DefaultDispatchConcurrency=1024`——量级取"合法高并发
+(慢处理器)永远碰不到、只有对端病态洪水才碰",32 的初值对热点慢处理器插件过紧,
+经 DialOptions/WithDispatchConcurrency/mount RemoteSpec 按需覆盖,有
+TestDispatchConcurrencyLimit 固化"满即 busy 不等待、释放即恢复");回复路由、Subscribe/Ping、push_event 保持内联(事件投递保序,
 慢处理器是插件自己的事)。代价(显式接受):入站请求的**处理不再保序**(帧按序
 读入、回复按 id 关联,顺序无依赖);插件侧 PluginOps 回调可能**并发**——与进程
 内插件 CallFunc 的既有并发语义对齐(作者侧回调须线程安全)。配套:响应 body

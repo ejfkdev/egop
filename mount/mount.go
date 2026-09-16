@@ -25,6 +25,9 @@ import (
 type RemoteSpec struct {
 	ID   string `json:"id"`
 	Addr string `json:"addr"`
+	// DispatchConcurrency 覆盖该会话入站请求并发派发上限(热点插件调大;
+	// 0 = remote.DefaultDispatchConcurrency)。
+	DispatchConcurrency int `json:"dispatch_concurrency,omitempty"`
 }
 
 // Sources 是装载来源的整份声明(消费方等装配根自己的配置文件,或运行时构造)。
@@ -135,7 +138,9 @@ func Mount(ctx context.Context, hf loader.HostFace, src Sources) (*Runtime, []er
 		if err != nil {
 			return fail(fmt.Errorf("mount: remote %s: %w", spec.ID, err))
 		}
-		adapter, sess, err := remote.DialStream(ctx, hf, stream, remote.DialOptions{WantID: spec.ID})
+		adapter, sess, err := remote.DialStream(ctx, hf, stream, remote.DialOptions{
+			WantID: spec.ID, DispatchConcurrency: spec.DispatchConcurrency,
+		})
 		if err != nil {
 			// DialStream 失败时一律返回 (nil, nil, err) 且已自行关闭会话;
 			// sess 必须判空,否则此处 nil.Close 会 panic。

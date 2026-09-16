@@ -245,7 +245,9 @@ func ServeStream(ctx, rh RemoteHost, stream Stream, token string, logf func(...)
 func DialStream(ctx, rh RemoteHost, stream Stream, opts DialOptions) (*Adapter, *Session, error) // 框架侧·出站
 func NewAdapter(sess *Session, mf contract.Manifest) *Adapter
 
-type DialOptions struct { WantID string }        // 校验远端清单 id 防连错
+type DialOptions struct { WantID string; DispatchConcurrency int }  // 防连错;入站派发上限覆盖(0=默认)
+func WithDispatchConcurrency(n int) AttachOption  // 同义(AttachStream/ServePluginStream 侧)
+const DefaultDispatchConcurrency = 1024           // 单会话入站请求并发派发默认上限(洪水护栏)
 type AttachOption func(*attachConfig)            // AttachStream 功能选项(加新选项不改签名)
 type Adapter struct{ /* Meta/CallFunc/ApplyConfig/ToolSpecs/ToolRaw/Manifest/Session/Close */ }
 type PluginOps struct { CallFunc; Tool; Hook func(ctx, hookID, data) any; ApplyConfig; PushEvent func(ctx, topic, e Event) }  // 插件作者侧回调(Hook 返 any 经 HookResultOf;PushEvent 与进程内订阅回调同签名)
@@ -288,7 +290,7 @@ type Sources struct {
     Dirs []string; FS fs.FS                  // wasm 目录(或注入 FS 内的根)
     ExtraSuffixes []string                   // 追加 zip 包后缀(透传 wasm/autoload)
     Watch bool; Interval time.Duration       // 热更
-    Remote []RemoteSpec                       // 出站远程 {ID, Addr}(须配 StreamDial)
+    Remote []RemoteSpec                       // 出站远程 {ID, Addr, DispatchConcurrency}(须配 StreamDial)
     StreamDial   func(ctx, addr string) (remote.Stream, error)   // 注入出站传输
     StreamAccept func(ctx) (remote.Stream, error)                // 注入入站传输
     Logf func(...)
@@ -301,9 +303,11 @@ func CheckDirs(ctx, dirs []string) []error   // 离线校验
 装配失败时句柄自行**全清**：停 watcher/会话/入站流，并反注册+关闭目录阶段已
 进册的插件（`Watcher.Unload`），宿主回到装配前状态；正常关停不做反注册——
 注册面归宿主总闸（`Host.Close`）。Close join accept/ServeStream goroutine
-(先关流/取消再等,不留迟到注册窗口)。远程会话的入站请求**并发派发**(有界
-32/会话):慢 op 不队头阻塞、同会话自调不死锁;请求处理不保序、插件侧
-PluginOps 回调可能并发(与进程内插件一致,须线程安全)。
+(先关流/取消再等,不留迟到注册窗口)。远程会话的入站请求**并发派发**(上限默认
+remote.DefaultDispatchConcurrency=1024/会话,DialOptions/WithDispatchConcurrency/
+mount RemoteSpec.dispatch_concurrency 可覆盖):慢 op 不队头阻塞、同会话自调不死锁;
+超额立即回执 busy 背压;请求处理不保序、插件侧 PluginOps 回调可能并发
+(与进程内插件一致,须线程安全)。
 
 ## schema（JSON Schema 子集）
 

@@ -70,7 +70,8 @@ abi.go(ABI 词汇与宿主注入表)。新增代码先对号入座;拆分移动�
   看门狗无解(停在 mutex 上的 Go 代码打不断)。收集类操作锁内只取快照、锁外调
   插件。
 - **remote 入站请求并发派发**:session.recvLoop 只内联回复路由/subscribe/ping/
-  push_event(事件保序),请求帧派发到带界 goroutine(32/会话,满则回 busy)——
+  push_event(事件保序),请求帧派发到带界 goroutine(默认 1024/会话,洪水护栏;
+  DialOptions/WithDispatchConcurrency/mount RemoteSpec 可调,满则立即回 busy)——
   慢 op 不队头阻塞、同会话自调不死锁;插件侧回调可并发,勿引入"依赖处理顺序"的
   隐含假设。
 - **wasm 生命周期字段竞争**:p.compiled/p.lastCfg 读写一律经 poolMu 快照
