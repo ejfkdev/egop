@@ -311,20 +311,49 @@ func (s *Session) dispatchAsync(ctx context.Context, peer Peer, f *Frame) {
 	}
 	fc := *f // 帧拷贝:f 是循环局部变量,下一轮复用
 	go func() {
-		defer func() { <-s.dispSem }()
-		switch fc.Kind {
-		case KindCallFunc:
-			s.dispatchCall(ctx, peer, &fc)
-		case KindTool:
-			s.dispatchTool(ctx, peer, &fc)
-		case KindHook:
-			s.dispatchHook(ctx, peer, &fc)
-		case KindApplyConfig:
-			s.dispatchConfig(ctx, peer, &fc)
-		case KindHostCall:
-			s.dispatchHostCall(ctx, peer, &fc)
+		reply := s.executeRequest(ctx, peer, &fc)
+		// 配额在**写回复之前**归还:对端收到回复 ⇒ 配额已释放是硬不变量——
+		// 收到回复后紧跟重试的调用方不会撞 busy(曾把归还放在回复后,慢机器上
+		// "回复-归还"间隙让立即重试收到假 busy,CI 实锤)。
+		<-s.dispSem
+		if reply != nil {
+			reply()
 		}
 	}()
+}
+
+// executeRequest 执行一个入站请求的 handler 部分(要求已持派发配额),返回
+// "写回复"动作(nil = 无回复);回复写在配额归还之后由调用方执行。
+func (s *Session) executeRequest(ctx context.Context, peer Peer, f *Frame) func() {
+	switch f.Kind {
+	case KindCallFunc:
+		ctx = withFrameOrigin(ctx, f)
+		out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleCall(ctx, f.Fname, f.Input) })
+		return s.replyAction(f.Id, ctx, out, err)
+	case KindTool:
+		out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleTool(ctx, f.Name, f.Input, f.Tctx) })
+		return s.replyAction(f.Id, ctx, out, err)
+	case KindHook:
+		ctx = withFrameOrigin(ctx, f)
+		out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHook(ctx, f.HookID, f.Input) })
+		return s.replyAction(f.Id, ctx, out, err)
+	case KindApplyConfig:
+		if err := peerCallErr(func() error { return peer.HandleApplyConfig(ctx, f.Config) }); err != nil {
+			return func() { s.replyErr(f.Id, err.Error()) }
+		}
+		return func() { s.replyTo(ctx, f.Id, okEnvelope(json.RawMessage("null"))) }
+	case KindHostCall:
+		out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHostCall(ctx, f.Op, f.Input) })
+		return s.replyAction(f.Id, ctx, out, err)
+	}
+	return nil
+}
+
+func (s *Session) replyAction(id uint64, ctx context.Context, out json.RawMessage, err error) func() {
+	if err != nil {
+		return func() { s.replyErr(id, err.Error()) }
+	}
+	return func() { s.replyTo(ctx, id, okEnvelope(out)) }
 }
 
 // recvLoop 是流的唯一读侧:回复路由回 pending,请求/单向帧按 kind 分发 peer。
@@ -424,70 +453,4 @@ func withFrameOrigin(ctx context.Context, f *Frame) context.Context {
 		return ctx
 	}
 	return contract.WithOrigin(ctx, f.Origin)
-}
-
-func (s *Session) dispatchCall(ctx context.Context, peer Peer, f *Frame) {
-	if peer == nil {
-		s.replyErr(f.Id, "remote: call before handshake")
-		return
-	}
-	ctx = withFrameOrigin(ctx, f)
-	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleCall(ctx, f.Fname, f.Input) })
-	if err != nil {
-		s.replyErr(f.Id, err.Error())
-		return
-	}
-	s.replyTo(ctx, f.Id, okEnvelope(out))
-}
-
-func (s *Session) dispatchTool(ctx context.Context, peer Peer, f *Frame) {
-	if peer == nil {
-		s.replyErr(f.Id, "remote: tool before handshake")
-		return
-	}
-	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleTool(ctx, f.Name, f.Input, f.Tctx) })
-	if err != nil {
-		s.replyErr(f.Id, err.Error())
-		return
-	}
-	s.replyTo(ctx, f.Id, okEnvelope(out))
-}
-
-func (s *Session) dispatchHook(ctx context.Context, peer Peer, f *Frame) {
-	if peer == nil {
-		s.replyErr(f.Id, "remote: hook before handshake")
-		return
-	}
-	ctx = withFrameOrigin(ctx, f)
-	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHook(ctx, f.HookID, f.Input) })
-	if err != nil {
-		s.replyErr(f.Id, err.Error())
-		return
-	}
-	s.replyTo(ctx, f.Id, okEnvelope(out))
-}
-
-func (s *Session) dispatchConfig(ctx context.Context, peer Peer, f *Frame) {
-	if peer == nil {
-		s.replyErr(f.Id, "remote: apply_config before handshake")
-		return
-	}
-	if err := peerCallErr(func() error { return peer.HandleApplyConfig(ctx, f.Config) }); err != nil {
-		s.replyErr(f.Id, err.Error())
-		return
-	}
-	s.replyTo(ctx, f.Id, okEnvelope(json.RawMessage("null")))
-}
-
-func (s *Session) dispatchHostCall(ctx context.Context, peer Peer, f *Frame) {
-	if peer == nil {
-		s.replyErr(f.Id, "remote: host_call before handshake")
-		return
-	}
-	out, err := peerCall(func() (json.RawMessage, error) { return peer.HandleHostCall(ctx, f.Op, f.Input) })
-	if err != nil {
-		s.replyErr(f.Id, err.Error())
-		return
-	}
-	s.replyTo(ctx, f.Id, okEnvelope(out))
 }

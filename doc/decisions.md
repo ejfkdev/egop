@@ -212,7 +212,10 @@ recvLoop 曾把入站请求帧(CallFunc/Tool/Hook/ApplyConfig/HostCall)**内联�
 一个慢 op 队头阻塞整条会话(其它请求的回复路由、事件推送全部排队),同会话自调
 (插件经 HostCall 回程调回自己)更是永久死锁——嵌套请求帧只有这条忙着的读循环能读。
 裁决:请求类帧派发到**带界工作 goroutine**(配额制,满即回执 busy 背压,
-绝不阻塞读循环;上限默认 `DefaultDispatchConcurrency=1024`——量级取"合法高并发
+绝不阻塞读循环;**配额在写回复之前归还**——"对端收到回复 ⇒ 配额已释放"是硬
+不变量,收到 busy 后立即重试的调用方不会在"回复-归还"间隙里撞假 busy(CI 慢
+机器上实锤过:配额曾放在回复之后归还,立即重试收到假 busy);上限默认
+`DefaultDispatchConcurrency=1024`——量级取"合法高并发
 (慢处理器)永远碰不到、只有对端病态洪水才碰",32 的初值对热点慢处理器插件过紧,
 经 DialOptions/WithDispatchConcurrency/mount RemoteSpec 按需覆盖,有
 TestDispatchConcurrencyLimit 固化"满即 busy 不等待、释放即恢复");回复路由、Subscribe/Ping、push_event 保持内联(事件投递保序,
