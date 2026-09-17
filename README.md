@@ -11,7 +11,10 @@ bundle / directory hot-reload / remote channel), and a ctx capability surface. I
 with zero assembly: `host.New` ships its own in-memory event bus and config events,
 `mount.Mount` wires up every external seam in one call. No business types (llm/react/agent
 etc.) enter this library — the host is generalized to `Host[C]`, and business capability
-is injected at the assembly layer (`Ops`/`OpAliases`/`ToolNames`).
+is injected at the assembly layer (`Ops`/`OpAliases`/`ToolNames`). WASM plugins run on
+an optional per-plugin instance pool (`egop.pool`) with self-healing revive after
+interrupted calls; the remote channel dispatches inbound requests on bounded concurrent
+goroutines (same-session self-calls and slow handlers never deadlock the stream).
 
 > **Status**: currently **v0.x (pre-1.0)**. The API is not frozen — pin a specific
 > commit/tag in `go get`, and check [doc/api.md](doc/api.md) before a minor upgrade.
@@ -166,6 +169,13 @@ The design follows three cordis mechanisms, mapped onto Go:
 (`Options.ToolNames()` or some registered plugin). **Function input/output validation is
 on by default**: `Host.Call` JSON-schema-validates `FuncSpec.Input`/`Output` (input rejected
 before call, output after), disabled wholesale by `Options.DisableFuncValidation`.
+
+**Free-form extension seam**: beyond the fixed axes, every declaration struct
+(`Meta`/`FuncSpec`/`HookPointSpec`/`EventTopicSpec`/`ConfigFieldSpec`/`Dependency`/
+`SlotSpec`) carries `Extensions` — a `(key string, value any)` map egop never interprets
+or validates, passed through verbatim on the wire (helper: `contract.Ext[T]`). The
+`egop.` prefix is reserved for library features (in use: `egop.pool`); custom keys
+define consumer-side semantics.
 
 ## Loading shapes
 

@@ -11,7 +11,9 @@
 （进程内 / WASM 包 / 目录热更 / 远程通道）与 ctx 能力面。作为通用库零
 装配即可跑通：`host.New` 自带内存事件总线与配置事件,`mount.Mount` 一个
 调用拉齐全部外接面,业务类型（llm/react/agent 等）一律不进本库——宿主泛化
-为 `Host[C]`,业务能力经装配注入（`Ops`/`OpAliases`/`ToolNames`）。
+为 `Host[C]`,业务能力经装配注入（`Ops`/`OpAliases`/`ToolNames`）。WASM 插件
+跑在可选的每插件实例池（`egop.pool`）上,调用被打断即自愈（revive）;远程通道
+的入站请求按有界并发派发（同会话自调、慢处理器都不会锁死整条流）。
 
 > **版本状态**：当前为 **v0.x（pre-1.0）**。API 尚未冻结，`go get` 请锁定具体
 > commit/tag；跨次要版本升级前请对照 [doc/api.md](doc/api.md) 核对签名。
@@ -164,6 +166,12 @@ defer rt.Close()
 的插件函数做 JSON Schema 校验——入参不合规在调用前拒绝、返回不合规在调用后
 拒绝（`Options.DisableFuncValidation` 整体关闭）。`schema.Validate` 支持 `type`
 单类型或类型数组、`anyOf`,覆盖"一个字段允许多种格式"（如 int 或 string）。
+
+**自由扩展缝**：固定轴之外,全部声明结构（`Meta`/`FuncSpec`/`HookPointSpec`/
+`EventTopicSpec`/`ConfigFieldSpec`/`Dependency`/`SlotSpec`）都带 `Extensions`——
+`(key string, value any)` 形态的自由键值,egop 不解释不校验,线上原样透传
+（取值助手 `contract.Ext[T]`）。`egop.` 前缀保留给库自身特性（在用：
+`egop.pool`）;自定义键由消费方约定自己的语义。
 
 ## 加载形态
 
