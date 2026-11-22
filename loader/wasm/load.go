@@ -7,6 +7,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +16,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ejfkdev/egop/contract"
 	"github.com/tetratelabs/wazero"
@@ -23,7 +28,43 @@ import (
 )
 
 // DefaultMaxPages 是 guest 内存上限的默认值(页,每页 64KiB → 64MiB)。
-const DefaultMaxPages uint32 = 1024
+// DefaultMaxPages 1024 页(64MiB)在重插件上不够:llm/react(自举 wasm)的
+// Go runtime 堆+JSON 序列化缓冲随会话史增长,大史会话 encoding/json growslice
+// 直接 allocLarge unreachable(2026-10-12 TSec 跑分 live 实锤,且 llm OOM 后
+// 压缩通道同死=无法自救)。4096 页(256MiB)=预留上限,线性内存按需 commit,
+// 调大不预占 RSS;轻插件不受影响(上限只是天花板)。
+const DefaultMaxPages uint32 = 4096
+
+// MaxPagesCeiling 是 egop.memory_pages 清单扩展可申请的上限(16384 页 = 1GiB)。
+// 线性内存按需 commit,提高上限只增加虚拟地址空间;重插件(llm/react)在清单里
+// 声明更高额度以容纳长请求/长输出,轻插件保持默认。
+const MaxPagesCeiling uint32 = 16384
+
+// sharedCompilationCache 进程级 wazero 编译缓存。
+//
+// 文件后端默认关闭(不落盘):插件是 6MB Go wasm,冷编译约 1s/个、几十个
+// 插件=50s 级 boot;文件缓存实测 56s→22s,但缓存目录约 1.1GB。是否用磁盘
+// 换启动时间由部署方决定——设 EGOP_WASM_CACHE_DIR=<dir> 即启用(目录由
+// wazero 管理,可直接删除;插件内容/Wazero 版本变会按 hash 自动失效)。
+// 未设/不可写时用进程内内存缓存(同一模块多实例仍复用编译结果)。
+var (
+	compCacheOnce sync.Once
+	compCache     wazero.CompilationCache
+)
+
+func sharedCompilationCache() wazero.CompilationCache {
+	compCacheOnce.Do(func() {
+		dir := strings.TrimSpace(os.Getenv("EGOP_WASM_CACHE_DIR"))
+		if dir != "" {
+			if c, err := wazero.NewCompilationCacheWithDir(dir); err == nil {
+				compCache = c
+				return
+			}
+		}
+		compCache = wazero.NewCompilationCache()
+	})
+	return compCache
+}
 
 // Options 是加载选项(零值可用)。
 type Options struct {
@@ -38,13 +79,34 @@ type Options struct {
 	// 输入)。0 = 默认(DefaultMaxEntryBytes / DefaultMaxTotalBytes)。
 	MaxEntryBytes int64
 	MaxTotalBytes int64
+	// MaxEntries 是 ZIP 总条目上限(含目录项);0 = DefaultMaxEntries。
+	MaxEntries int
 }
 
-// zip 解压默认上限:单条目 256MiB、整包聚合 1GiB(正常插件包远小于此;
+// AssetInfo 是暂存包检查时暴露的资产元数据;Name 与 Plugin.Assets 的键一致,
+// 不含 "assets/" 前缀。SHA256 供上传方做完整性展示或去重,不暴露资产字节。
+type AssetInfo struct {
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+// PackageInspection 是 ZIP 包的静态检查结果。EntryCount 含目录项,TotalBytes
+// 是全部文件项的实际解压字节数;WASMSize 单独给出 plugin.wasm 大小。
+type PackageInspection struct {
+	Manifest   contract.Manifest `json:"manifest"`
+	Assets     []AssetInfo       `json:"assets"`
+	WASMSize   int64             `json:"wasm_size"`
+	EntryCount int               `json:"entry_count"`
+	TotalBytes int64             `json:"total_bytes"`
+}
+
+// zip 解压默认上限:单条目 256MiB、整包聚合 1GiB、4096 条(正常插件包远小于此;
 // 恶意高压缩比包在触顶时立即拒载,不被读进内存)。
 const (
 	DefaultMaxEntryBytes int64 = 256 << 20
 	DefaultMaxTotalBytes int64 = 1 << 30
+	DefaultMaxEntries          = 4096
 )
 
 // IsPluginFile 判定文件名是否插件包(内置 *.egop.wasm / *.egop.zip + extra 追加
@@ -69,6 +131,61 @@ func isZipName(lower string, extra []string) bool {
 		}
 	}
 	return false
+}
+
+// InspectPackage 静态检查暂存的 ZIP 插件包,返回清单与资产元数据。与 LoadFS
+// 不同,它要求 plugin.wasm 存在,并且只编译模块:每次使用全新的 runtime 和内存
+// 编译缓存,绝不实例化模块、调用导出或执行 start 函数,也不读取共享/磁盘缓存。
+// name 只用于错误定位,ZIP 后缀由调用方按自己的上传策略判定。
+func InspectPackage(ctx context.Context, data []byte, name string, opts Options) (*PackageInspection, error) {
+	if name == "" {
+		name = "plugin.zip"
+	}
+	pkg, err := parseZipPackage(data, opts)
+	if err != nil {
+		return nil, fmt.Errorf("wasm plugin %s: %w", name, err)
+	}
+	if pkg.wasm == nil {
+		return nil, fmt.Errorf("wasm plugin %s: zip missing plugin.wasm (required for inspection)", name)
+	}
+
+	p := newPlugin(name)
+	p.manifest = pkg.manifest
+	cache := wazero.NewCompilationCache()
+	defer func() { _ = cache.Close(context.Background()) }()
+	rcfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(p.memoryPages(opts)).WithCompilationCache(cache)
+	r := wazero.NewRuntimeWithConfig(ctx, rcfg)
+	defer func() { _ = r.Close(context.Background()) }()
+	compiled, err := r.CompileModule(ctx, pkg.wasm)
+	if err != nil {
+		return nil, fmt.Errorf("wasm plugin %s: compile: %w", name, err)
+	}
+	defer func() { _ = compiled.Close(context.Background()) }()
+	if err := validateHostImports(name, compiled.ImportedFunctions()); err != nil {
+		return nil, err
+	}
+	if err := validateStructuralABI(name, pkg.manifest, compiled.ExportedFunctions(), compiled.ExportedMemories()); err != nil {
+		return nil, err
+	}
+
+	out := &PackageInspection{
+		Manifest:   pkg.manifest,
+		WASMSize:   int64(len(pkg.wasm)),
+		EntryCount: pkg.entryCount,
+		TotalBytes: pkg.totalBytes,
+		Assets:     make([]AssetInfo, 0, len(pkg.assets)),
+	}
+	names := make([]string, 0, len(pkg.assets))
+	for assetName := range pkg.assets {
+		names = append(names, assetName)
+	}
+	sort.Strings(names)
+	for _, assetName := range names {
+		raw := pkg.assets[assetName]
+		sum := sha256.Sum256(raw)
+		out.Assets = append(out.Assets, AssetInfo{Name: assetName, Size: int64(len(raw)), SHA256: hex.EncodeToString(sum[:])})
+	}
+	return out, nil
 }
 
 // LoadFile 按路径加载插件包(name 取文件名以判定包形态)。
@@ -155,12 +272,13 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 	// revive 锚:留住代码字节与装载选项(意外打断后按原样重建;显式 Close 不适用)。
 	p.wasmRaw = append([]byte(nil), wasmBytes...)
 	p.loadOpts = opts
-	lim := opts.MaxMemoryPages
-	if lim == 0 {
-		lim = DefaultMaxPages
-	}
+	lim := p.memoryPages(opts)
+	p.memPages = lim
 	p.logFn = opts.LogFn
-	rcfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(lim)
+	rcfg := wazero.NewRuntimeConfig().WithMemoryLimitPages(lim).WithCloseOnContextDone(true)
+	if cc := sharedCompilationCache(); cc != nil {
+		rcfg = rcfg.WithCompilationCache(cc)
+	}
 	r := wazero.NewRuntimeWithConfig(ctx, rcfg)
 	p.runtime = r
 
@@ -189,18 +307,18 @@ func (p *Plugin) instantiate(ctx context.Context, wasmBytes []byte, opts Options
 		return fmt.Errorf("wasm plugin %s: compile: %w", p.name, err)
 	}
 	p.compiled = compiled
-	for _, def := range compiled.ImportedFunctions() {
-		modName, fName, _ := def.Import()
-		if modName != HostModuleName && modName != WASIModule {
-			return fmt.Errorf("wasm plugin %s: import %q.%q not allowed (only %q and %q)",
-				p.name, modName, fName, HostModuleName, WASIModule)
-		}
-		if modName == HostModuleName && !hostImportSet[fName] {
-			return fmt.Errorf("wasm plugin %s: unknown host import %q.%q", p.name, modName, fName)
-		}
+	if err := validateHostImports(p.name, compiled.ImportedFunctions()); err != nil {
+		return err
 	}
 	if pool < 1 {
 		pool = 1
+	}
+	if pool > 1 {
+		// 有效池大小必须可见:容量类故障(实例被占满后静默排队)在外部只表现为
+		// 「agent 不动」,没有这行就无法区分「池小」与「模型/网络慢」。
+		fmt.Fprintf(os.Stderr, "%s wasm plugin %s: pool=%d(单实例上限 %dMiB,主机内存 %dMiB)\n",
+			time.Now().Format("2006/01/02 15:04:05"), p.name, pool,
+			p.instMaxBytes()/(1<<20), hostMemoryBytes()/(1<<20))
 	}
 	for idx := 0; idx < pool; idx++ {
 		i := newInst(fmt.Sprintf("%s#%d", p.name, idx))
@@ -235,34 +353,106 @@ func (p *Plugin) instantiateOne(ctx context.Context, compiled wazero.CompiledMod
 	return mod, nil
 }
 
-// validate 校验 ABI 结构性前提(清单之外的部分)。
+// validate 校验 ABI 结构性前提(清单之外的部分)。实例化后的正常装载与
+// InspectPackage 的纯编译检查共用 validateStructuralABI,防两条入口逐渐漂移。
 func (p *Plugin) validate() error {
-	if p.manifest.ID == "" {
-		return fmt.Errorf("wasm plugin %s: manifest id required", p.name)
-	}
 	m := p.insts[0].mod
-	if m.Memory() == nil {
-		return fmt.Errorf("wasm plugin %s: memory not exported (ABI requires (memory (export \"memory\")))", p.name)
-	}
-	if m.ExportedFunction(ExportHostAlloc) == nil {
-		return fmt.Errorf("wasm plugin %s: export %q missing (ABI required)", p.name, ExportHostAlloc)
-	}
-	if len(p.manifest.Provides.Functions) > 0 && m.ExportedFunction(ExportCall) == nil {
-		return fmt.Errorf("wasm plugin %s: declares functions but export %q missing", p.name, ExportCall)
-	}
-	if len(p.manifest.Tools) > 0 && m.ExportedFunction(ExportTool) == nil {
-		return fmt.Errorf("wasm plugin %s: declares tools but export %q missing", p.name, ExportTool)
-	}
-	// 双形状导出按精确元数校验(4=旧版两参对 / 6=新版含 Origin 第三参对;
-	// 调用侧按 ==6 决定是否传 Origin,其它元数无法兑现任何一种 ABI,装载期即拒)。
-	for _, name := range []string{ExportCall, ExportOnHook} {
-		if fn := m.ExportedFunction(name); fn != nil {
-			if n := len(fn.Definition().ParamTypes()); n != 4 && n != 6 {
-				return fmt.Errorf("wasm plugin %s: export %q has %d params (ABI wants 4 or 6 i32)", p.name, name, n)
+	return validateStructuralABI(p.name, p.manifest, m.ExportedFunctionDefinitions(), m.ExportedMemoryDefinitions())
+}
+
+// validateHostImports 是正常装载与静态检查共用的宿主 import 白名单。
+func validateHostImports(pluginName string, imports []api.FunctionDefinition) error {
+	for _, def := range imports {
+		modName, fName, _ := def.Import()
+		if modName != HostModuleName && modName != WASIModule {
+			return fmt.Errorf("wasm plugin %s: import %q.%q not allowed (only %q and %q)",
+				pluginName, modName, fName, HostModuleName, WASIModule)
+		}
+		if modName == HostModuleName {
+			var expected *hostOp
+			for i := range hostOps {
+				if hostOps[i].name == fName {
+					expected = &hostOps[i]
+					break
+				}
+			}
+			if expected == nil {
+				return fmt.Errorf("wasm plugin %s: unknown host import %q.%q", pluginName, modName, fName)
+			}
+			params := def.ParamTypes()
+			if len(params) != expected.pairs*2 || len(def.ResultTypes()) != 1 || def.ResultTypes()[0] != api.ValueTypeI64 {
+				return fmt.Errorf("wasm plugin %s: host import %q.%q has incompatible signature", pluginName, modName, fName)
+			}
+			for _, typ := range params {
+				if typ != api.ValueTypeI32 {
+					return fmt.Errorf("wasm plugin %s: host import %q.%q has incompatible signature", pluginName, modName, fName)
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// validateStructuralABI 只读 wazero 的模块定义,不调用任何 guest 函数。
+// call/on_hook 的 4 参旧形与 6 参 Origin 新形都保留;tool 始终是三对 ptr/len。
+func validateStructuralABI(pluginName string, mf contract.Manifest, functions map[string]api.FunctionDefinition, memories map[string]api.MemoryDefinition) error {
+	if mf.ID == "" {
+		return fmt.Errorf("wasm plugin %s: manifest id required", pluginName)
+	}
+	if memories["memory"] == nil {
+		return fmt.Errorf("wasm plugin %s: memory not exported (ABI requires (memory (export \"memory\")))", pluginName)
+	}
+	alloc := functions[ExportHostAlloc]
+	if alloc == nil {
+		return fmt.Errorf("wasm plugin %s: export %q missing (ABI required)", pluginName, ExportHostAlloc)
+	}
+	if err := validateExportSignature(pluginName, ExportHostAlloc, alloc, []int{1}, api.ValueTypeI32, "1 i32 param and 1 i32 result"); err != nil {
+		return err
+	}
+	if len(mf.Provides.Functions) > 0 && functions[ExportCall] == nil {
+		return fmt.Errorf("wasm plugin %s: declares functions but export %q missing", pluginName, ExportCall)
+	}
+	if len(mf.Tools) > 0 && functions[ExportTool] == nil {
+		return fmt.Errorf("wasm plugin %s: declares tools but export %q missing", pluginName, ExportTool)
+	}
+	for _, name := range []string{ExportCall, ExportOnHook} {
+		if fn := functions[name]; fn != nil {
+			if err := validateExportSignature(pluginName, name, fn, []int{4, 6}, api.ValueTypeI64, "4 or 6 i32 params and 1 i64 result"); err != nil {
+				return err
+			}
+		}
+	}
+	if fn := functions[ExportTool]; fn != nil {
+		if err := validateExportSignature(pluginName, ExportTool, fn, []int{6}, api.ValueTypeI64, "6 i32 params and 1 i64 result"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateExportSignature(pluginName, name string, fn api.FunctionDefinition, paramCounts []int, result api.ValueType, want string) error {
+	params := fn.ParamTypes()
+	countOK := false
+	for _, count := range paramCounts {
+		if len(params) == count {
+			countOK = true
+			break
+		}
+	}
+	results := fn.ResultTypes()
+	if countOK && len(results) == 1 && results[0] == result {
+		valid := true
+		for _, typ := range params {
+			if typ != api.ValueTypeI32 {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return nil
+		}
+	}
+	return fmt.Errorf("wasm plugin %s: export %q has params %v results %v (ABI wants %s)", pluginName, name, params, results, want)
 }
 
 // validateCodeless 校验无代码插件(纯清单/资产):只需 id,且不得声明任何需要
@@ -345,6 +535,16 @@ func readULEB(bin []byte, pos int) (int, int) {
 	return 0, 0
 }
 
+// zipPackage 是拆包结果及观察元数据;正常装载只取前三个字段,静态检查保留
+// 条目数与实际解压量供上传方展示。
+type zipPackage struct {
+	manifest   contract.Manifest
+	wasm       []byte
+	assets     map[string][]byte
+	entryCount int
+	totalBytes int64
+}
+
 // parseZip 拆 zip 包(*.egop.zip 或注入后缀):manifest.json(必需)+
 // plugin.wasm(可选)+ assets/*(可选)。plugin.wasm 缺省 = 「无代码插件」
 // (纯清单/资产,如 UI 插件):manifest 声明扩展、assets 携带静态资源,宿主经
@@ -352,11 +552,20 @@ func readULEB(bin []byte, pos int) (int, int) {
 // 插件是不可信输入:每条目与聚合解压量都设上限(头部声明值预检 + 读取时硬限,
 // 谎报尺寸的炸弹包在触顶即拒载),防 zip bomb 打爆宿主内存。
 func parseZip(data []byte, opts Options) (contract.Manifest, []byte, map[string][]byte, error) {
-	var mf contract.Manifest
+	pkg, err := parseZipPackage(data, opts)
+	if err != nil {
+		return contract.Manifest{}, nil, nil, err
+	}
+	return pkg.manifest, pkg.wasm, pkg.assets, nil
+}
+
+func parseZipPackage(data []byte, opts Options) (zipPackage, error) {
+	var pkg zipPackage
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return mf, nil, nil, fmt.Errorf("bad zip: %w", err)
+		return pkg, fmt.Errorf("bad zip: %w", err)
 	}
+	pkg.entryCount = len(zr.File)
 	entryLim := opts.MaxEntryBytes
 	if entryLim <= 0 {
 		entryLim = DefaultMaxEntryBytes
@@ -365,55 +574,141 @@ func parseZip(data []byte, opts Options) (contract.Manifest, []byte, map[string]
 	if totalLim <= 0 {
 		totalLim = DefaultMaxTotalBytes
 	}
-	var manRaw, wasmBytes []byte
-	assets := map[string][]byte{}
-	var total int64
+	maxEntries := opts.MaxEntries
+	if maxEntries <= 0 {
+		maxEntries = DefaultMaxEntries
+	}
+	if len(zr.File) > maxEntries {
+		return pkg, fmt.Errorf("zip: %d entries exceeds limit %d", len(zr.File), maxEntries)
+	}
+	var manRaw []byte
+	pkg.assets = map[string][]byte{}
+	seen := map[string]string{}
+	var declaredTotal, total int64
 	for _, f := range zr.File {
+		if err := validateZipEntry(f); err != nil {
+			return pkg, err
+		}
+		key := strings.ToLower(strings.TrimSuffix(f.Name, "/"))
+		if previous, ok := seen[key]; ok {
+			return pkg, fmt.Errorf("zip entry %s: duplicate or case-colliding path (also %s)", f.Name, previous)
+		}
+		seen[key] = f.Name
 		if f.FileInfo().IsDir() {
 			continue
 		}
-		if int64(f.UncompressedSize64) > entryLim {
-			return mf, nil, nil, fmt.Errorf("zip entry %s: declared size %d exceeds per-entry limit %d", f.Name, f.UncompressedSize64, entryLim)
+		if f.UncompressedSize64 > uint64(entryLim) {
+			return pkg, fmt.Errorf("zip entry %s: declared size %d exceeds per-entry limit %d", f.Name, f.UncompressedSize64, entryLim)
 		}
-		total += int64(f.UncompressedSize64)
-		if total > totalLim {
-			return mf, nil, nil, fmt.Errorf("zip: aggregate uncompressed size exceeds limit %d", totalLim)
+		declared := int64(f.UncompressedSize64)
+		if declaredTotal > totalLim-declared {
+			return pkg, fmt.Errorf("zip: aggregate uncompressed size exceeds limit %d", totalLim)
 		}
+		declaredTotal += declared
 		rc, err := f.Open()
 		if err != nil {
-			return mf, nil, nil, fmt.Errorf("zip entry %s: %w", f.Name, err)
+			return pkg, fmt.Errorf("zip entry %s: %w", f.Name, err)
 		}
-		// 硬限读取:头部声明可以是谎报,以实际字节数为准(+1 探测超限)。
-		raw, err := io.ReadAll(io.LimitReader(rc, entryLim+1))
+		// 硬限读取同时受单条与剩余聚合预算约束;+1 只用于探测超限,并避开
+		// MaxInt64 溢出。头部声明偏小时也不会先读出超过总预算的一整条。
+		readLim := entryLim
+		remaining := totalLim - total
+		if remaining < readLim {
+			readLim = remaining
+		}
+		if readLim < int64(1<<63-1) {
+			readLim++
+		}
+		raw, err := io.ReadAll(io.LimitReader(rc, readLim))
 		rc.Close()
 		if err != nil {
-			return mf, nil, nil, fmt.Errorf("zip entry %s: %w", f.Name, err)
+			return pkg, fmt.Errorf("zip entry %s: %w", f.Name, err)
 		}
 		if int64(len(raw)) > entryLim {
-			return mf, nil, nil, fmt.Errorf("zip entry %s: exceeds per-entry limit %d", f.Name, entryLim)
+			return pkg, fmt.Errorf("zip entry %s: exceeds per-entry limit %d", f.Name, entryLim)
 		}
+		if int64(len(raw)) > remaining {
+			return pkg, fmt.Errorf("zip: aggregate uncompressed size exceeds limit %d", totalLim)
+		}
+		total += int64(len(raw))
 		switch {
 		case f.Name == "manifest.json":
 			manRaw = raw
 		case f.Name == "plugin.wasm":
-			wasmBytes = raw
+			pkg.wasm = raw
 		case strings.HasPrefix(f.Name, "assets/"):
 			key := strings.TrimPrefix(f.Name, "assets/")
 			// 资产名会经 Assets()/read_asset 交给消费方(可能落盘服务),拒绝
 			// 绝对路径与 ".." 穿越(zip-slip 防在源头)。
 			if key == "" || path.Clean("/"+key) != "/"+key {
-				return mf, nil, nil, fmt.Errorf("zip entry %s: unsafe asset name", f.Name)
+				return pkg, fmt.Errorf("zip entry %s: unsafe asset name", f.Name)
 			}
-			assets[key] = raw
+			pkg.assets[key] = raw
 		}
 	}
+	pkg.totalBytes = total
 	if manRaw == nil {
-		return mf, nil, nil, fmt.Errorf("%s zip missing manifest.json (required bundle layout)", SuffixZip)
+		return pkg, fmt.Errorf("%s zip missing manifest.json (required bundle layout)", SuffixZip)
 	}
-	if err := json.Unmarshal(manRaw, &mf); err != nil {
-		return mf, nil, nil, fmt.Errorf("bad manifest.json: %w", err)
+	if err := json.Unmarshal(manRaw, &pkg.manifest); err != nil {
+		return pkg, fmt.Errorf("bad manifest.json: %w", err)
 	}
-	return mf, wasmBytes, assets, nil
+	return pkg, nil
+}
+
+// validateZipEntry 在读取任何条目之前检查全包路径与文件类型。未知的安全普通
+// 文件仍可为兼容而忽略,但恶意条目不能因为不在 assets/ 下就被静默跳过。
+func validateZipEntry(f *zip.File) error {
+	name := f.Name
+	unsafe := func(reason string) error {
+		return fmt.Errorf("zip entry %q: %s", name, reason)
+	}
+	if name == "" {
+		return unsafe("empty path")
+	}
+	if strings.ContainsRune(name, '\x00') {
+		return unsafe("NUL in path")
+	}
+	if strings.Contains(name, `\`) {
+		return unsafe("backslash in path")
+	}
+	if path.IsAbs(name) || hasWindowsDrive(name) {
+		return unsafe("absolute path")
+	}
+	cleanName := strings.TrimSuffix(name, "/")
+	if cleanName == "" || cleanName == "." {
+		return unsafe("empty or non-canonical path")
+	}
+	for _, part := range strings.Split(cleanName, "/") {
+		if part == ".." {
+			return unsafe("parent path traversal")
+		}
+	}
+	if path.Clean(cleanName) != cleanName {
+		return unsafe("non-canonical path")
+	}
+	mode := f.Mode()
+	if mode&fs.ModeSymlink != 0 {
+		return unsafe("symlink not allowed")
+	}
+	if f.FileInfo().IsDir() {
+		if typ := mode & fs.ModeType; typ != 0 && typ != fs.ModeDir {
+			return unsafe("special file not allowed")
+		}
+		return nil
+	}
+	if !mode.IsRegular() {
+		return unsafe("special file not allowed")
+	}
+	return nil
+}
+
+func hasWindowsDrive(name string) bool {
+	if len(name) < 2 || name[1] != ':' {
+		return false
+	}
+	c := name[0]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // ScanFS 遍历只读文件系统发现插件包(后缀判定与 LoadFS 同一 helper:内置

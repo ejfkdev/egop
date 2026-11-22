@@ -247,3 +247,16 @@ TestDispatchConcurrencyLimit 固化"满即 busy 不等待、释放即恢复");�
 的 accept/ServeStream goroutine 计入 WaitGroup,Close 释锁后 join——关停不留
 迟到注册窗口。回归:TestFailedContentNotRetriedUntilChange、
 TestRegisterFailureKeepsInstance。
+
+## 29. 生命周期按 generation 排空，管理操作复用同一工件真源
+
+- Host.Call 与已收集 Tool.Run 进入前取得当前 generation lease。Replace/Remove 先封闭旧代准入，
+  等待 lease 与可选 Quiescer 静默后才提交；等待超时/调用方取消只恢复旧代准入，不强杀调用，
+  也不提前清退旧 effect。Remove 的整个级联共享同一 deadline，避免依赖数量放大等待上限。
+- Diagnostics 提供插件、依赖满足度、busy、脱敏配置、函数与主题只读快照，配置事件和诊断均按
+  Secret 声明优先脱敏。结构化 ErrorDetail 在进程内与远程信封间保持同构，展示文本继续兼容。
+- InspectPackage 只做 ZIP 边界/清单校验与模块编译，不实例化、不调用导出或 start，也不使用
+  共享/磁盘编译缓存。Watcher/Runtime 的 PollStable、ArtifactState、Reload 都复用目录观察器，
+  使手动管理操作与后台热更共享两轮确认、失败回滚、配置回放和工件 hash 对账。
+- 函数与配置 schema 按 draft 2020-12 完整校验；本地引用可用，任何外部 schema 资源都在编译期
+  拒绝，不因校验而读文件或访问网络。

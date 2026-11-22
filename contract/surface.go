@@ -126,6 +126,21 @@ type FS interface {
 	ReadDir(name string) ([]DirEntry, error)
 }
 
+// FileStat 单文件元数据(范围读/大文件分页的定位面)。
+type FileStat struct {
+	Size    int64  `json:"size"`
+	Mode    uint32 `json:"mode,omitempty"`
+	ModTime int64  `json:"mod_time,omitempty"` // unix 毫秒
+}
+
+// FSEx 是 FS 的**可选扩展**:大文件按范围读/追加,避免整文件跨 ABI。
+// 实现方(OSFS 等)按需提供;缺席时对应 ABI 返回"不支持"(fail-closed,不静默降级)。
+type FSEx interface {
+	Stat(name string) (FileStat, error)
+	ReadRange(name string, off, n int64) ([]byte, error)
+	Append(name string, data []byte) error
+}
+
 // DirEntry 目录列举的一项(ReadDir 结果最小形状;名字+是否目录,细节留实现方)。
 type DirEntry struct {
 	Name  string `json:"name"`

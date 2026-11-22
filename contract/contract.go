@@ -156,13 +156,14 @@ func globMatch(pattern, s string) bool {
 // type/at/meta 为可选上下文：type 结果内容类型,at 时间戳(ms),meta 开放元数据
 // (correlation id、来源插件等,由生产/消费方约定)。
 type ResultEnvelope struct {
-	OK        bool            `json:"ok"`
-	Result    json.RawMessage `json:"result,omitempty"`
-	ResultB64 string          `json:"result_b64,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Type      string          `json:"type,omitempty"`
-	At        int64           `json:"at,omitempty"`
-	Meta      json.RawMessage `json:"meta,omitempty"`
+	OK          bool            `json:"ok"`
+	Result      json.RawMessage `json:"result,omitempty"`
+	ResultB64   string          `json:"result_b64,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	ErrorDetail *ErrorDetail    `json:"error_detail,omitempty"`
+	Type        string          `json:"type,omitempty"`
+	At          int64           `json:"at,omitempty"`
+	Meta        json.RawMessage `json:"meta,omitempty"`
 }
 
 // ---- 能力词与配置键占位框架 ----

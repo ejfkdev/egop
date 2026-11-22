@@ -25,7 +25,12 @@ type ConfigFieldSpec struct { Key, Description string; Schema, Default json.RawM
     Readable, Writable, Secret bool; Extensions map[string]json.RawMessage }  // Secret=声明优先脱敏(观察事件)
 type Dependency struct { Plugin, Slot string; Kind DependencyKind; MinVersion string;
     Extensions map[string]json.RawMessage }  // Plugin/Slot 恰有其一(双空拒载;双取 Slot 优先)
-type ResultEnvelope struct { OK bool; Result json.RawMessage; ResultB64, Error, Type string; At int64; Meta json.RawMessage }
+type ResultEnvelope struct { OK bool; Result json.RawMessage; ResultB64, Error, Type string;
+    ErrorDetail *ErrorDetail; At int64; Meta json.RawMessage }  // error_detail 可选，error 仍是兼容展示文本
+type ErrorDetail struct { Code, Phase, Plugin, Fn, Path string; Retryable bool; Message string }
+type CallError struct { Detail ErrorDetail }
+func NewCallError(detail ErrorDetail) *CallError
+func ErrorDetailOf(err error) (ErrorDetail, bool)
 type Event struct { Type, SubType string; Version int; Source *Origin; Payload json.RawMessage; Labels map[string]string }
 type EventFilter struct { Type, SubType string; SourceID, SourceVersion string; SourceKind OriginKind; Labels map[string]string }
 func (f EventFilter) Match(e Event) bool   // nil/零值命中一切;Type 含 '*' 通配;Labels 子集相等;字段间 AND
@@ -38,6 +43,9 @@ type FileStore interface { Read(name string) ([]byte, error); Write(name string,
 type KeyValue interface { Get(key string) ([]byte, bool); Put(key string, v []byte); Delete(key string); Keys() []string }
 type FS interface { ReadFile(name string) ([]byte, error); WriteFile(name string, data []byte) error;
     ReadDir(name string) ([]DirEntry, error) }  // 全局文件系统注入后端(范围/沙箱由实现定;ReadDir 列一层)
+type FSEx interface { Stat(name string) (FileStat, error); ReadRange(name string, off, n int64) ([]byte, error);
+    Append(name string, data []byte) error }  // 可选扩展；宿主仍按 fs.read/fs.write 分向门控，未实现时明确报不支持
+type FileStat struct { Size int64; Mode uint32; ModTime int64 }
 type DirEntry struct { Name string; IsDir bool; Size, ModTime int64 }  // ModTime=unix 毫秒,0 未知
 type Storage interface { File(pluginID string) FileStore; KV(pluginID string) KeyValue }
 type OriginKind string   // event | hook | call | host
@@ -141,9 +149,13 @@ type Options[C any] struct {
     ToolNames func() []string        // 框架已就位的工具面
     SlotLookup func(id) (contract.SlotSpec, bool)
     DisableFuncValidation bool       // 关函数 schema 校验(默认 false=开)
+    ReplaceQuiesce time.Duration     // 替换前排空旧代的上限；超时保旧代并恢复准入
+    RemoveQuiesce time.Duration      // 卸载前排空旧代的上限；整个级联共享上限
     Logf func(format string, args ...any)   // 生命周期日志
 }
 type Op func(ctx, input json.RawMessage) (json.RawMessage, error)
+type Quiescer interface { Busy() (bool, error) } // 可选实例忙闲探测；不能替代宿主在飞调用 lease
+var ErrQuiesceTimeout error                       // 静默等待超时的可匹配错误
 type Source = contract.Source
 ```
 
@@ -154,8 +166,11 @@ Register(p contract.Plugin) error                              // 单件注册(�
 RegisterMany(plugs []contract.Plugin) RegisterReport           // 批量+拓扑排序+隔离
 RegisterLazy(p contract.Plugin) (RegisterStatus, error)         // 依赖未满足先入队,到位后自动补载
 // type RegisterStatus int // StatusRegistered | StatusPending
-Replace(p contract.Plugin) error                                 // 与 Register 同款契约校验(依赖/槽位),拒换保旧版;快照+配置回灌
+Replace(p contract.Plugin) error                                 // 全目录预检+封闭旧代+排空+原子替换；失败保旧版
+ReplaceContext(ctx, p contract.Plugin) error                      // 同上，可取消；等待上限取 ReplaceQuiesce
 Remove(pluginID string, cascade bool) ([]string, error)          // 级联卸载 / fail-closed(点名与槽位依赖同判;victims 去重)
+RemoveContext(ctx, pluginID string, cascade bool) ([]string, error) // 可取消卸载；超时/取消不提交，恢复旧代准入
+ValidateProspective(m contract.Meta) error                        // 在拟提交目录上重验全部依赖与槽位，不实例化、不改注册表
 Call(ctx, pluginID, fname string, input json.RawMessage) (json.RawMessage, error) // 含 schema 校验
 SetConfig(pluginID string, cfg json.RawMessage) error          // 校验 + 广播 config.updated(整对象替换;观察事件 Secret 声明优先脱敏)
 SetConfigField(pluginID, key string, value json.RawMessage) error // 单字段合并(再下发)
@@ -166,6 +181,8 @@ HasPlugin(id string) bool
 Dependents(pluginID string) []string                           // 谁在依赖它
 CapabilityIndex() map[string][]string                          // 能力词 → 声明者
 Functions() []FnView                                            // 函数目录快照
+Function(pluginID, fname string) (contract.FuncSpec, bool)       // 单函数规格查询，不构造全目录
+Diagnostics() Diagnostics                                       // 插件/依赖/busy/脱敏配置/函数/主题只读快照
 Tools() []Tool[C]                                               // 工具收集(声明 tool.provide)
 OnHook(hookID string, fn contract.HookFunc) func()             // 注册 hook 回调(返回撤销)
 TriggerHook(ctx, hookID string, data json.RawMessage) []contract.HookResult // 触发 hook;observe 点按声明丢弃 Block
@@ -193,19 +210,27 @@ type Snapshot struct { Plugins []contract.Meta; Functions []FnView; Capabilities
 const DefaultMaxPages uint32 = 1024
 const DefaultMaxEntryBytes int64 = 256 << 20   // zip 单条目解压上限
 const DefaultMaxTotalBytes int64 = 1 << 30     // zip 整包聚合解压上限
+const DefaultMaxEntries = 4096                 // zip 总条目上限(含目录项)
 type Options struct {
     MaxMemoryPages uint32
     LogFn func(level, msg string)
     ExtraSuffixes []string   // 追加 zip 包后缀(如品牌 ".x.zip";布局同 .egop.zip;库内不内置业务词)
     MaxEntryBytes int64      // 0 = DefaultMaxEntryBytes(防 zip bomb)
     MaxTotalBytes int64      // 0 = DefaultMaxTotalBytes
+    MaxEntries int           // 0 = DefaultMaxEntries
 }
+
+type AssetInfo struct { Name string; Size int64; SHA256 string }
+type PackageInspection struct { Manifest contract.Manifest; Assets []AssetInfo;
+    WASMSize, TotalBytes int64; EntryCount int }
 
 func IsPluginFile(name string, extra []string) bool               // 后缀判定唯一收敛点(扫描/装载共用)
 func LoadFile(ctx, path string, opts Options) (*Plugin, error)      // 单文件(os)
 func LoadFS(ctx, data []byte, name string, opts Options) (*Plugin, error)  // 直接字节
 func ScanFS(ctx, fsys fs.FS, opts Options) ([]*Plugin, []error)     // fs.FS 遍历
 func ScanDir(ctx, dir string, opts Options) ([]*Plugin, []error)    // = ScanFS(os.DirFS(dir))
+func InspectPackage(ctx, data []byte, name string, opts Options) (*PackageInspection, error)
+// 静态检查 ZIP：只校验边界/清单并编译模块；不实例化、不调用导出或 start、不使用共享/磁盘缓存
 const MaxFSReadBytes = 8 << 20   // fs_read 单次回传 guest 的 ABI 尺寸护栏(信封 base64 放大前拒)
 
 type Plugin struct{ /* Meta/CallFunc/ApplyConfig/Config/SetSurface/ToolSpecs/ToolRaw/Close */ }
@@ -273,6 +298,10 @@ type Event struct { Action; PluginID; Path; Version; Err }
 
 func New(hf loader.HostFace, dirs []string, opts Options) *Watcher
 func (w *Watcher) Start(ctx); (w *Watcher) Stop(); (w *Watcher) Poll(ctx) []Event; (w *Watcher) Events() <-chan Event
+func (w *Watcher) PollStable(ctx) []Event                       // 同一互斥区内完成两轮确认
+func (w *Watcher) ArtifactState(pluginID string) (path, hash string, ok bool)
+func (w *Watcher) PathFor(pluginID string) (string, bool)
+func (w *Watcher) Reload(ctx, pluginID string) ([]Event, error)  // 目录工件强制重建；仍走两段确认/失败回滚
 func (w *Watcher) Unload(ctx)   // 反注册+关闭全部已加载插件(mount 装配失败全清用;正常关停走宿主总闸)
 ```
 
@@ -297,6 +326,10 @@ type Sources struct {
 }
 func Mount(ctx, hf loader.HostFace, src Sources) (*Runtime, []error, error)
 type Runtime struct{ /* Events() <-chan autoload.Event; Close() */ }
+func (rt *Runtime) Poll(ctx) []autoload.Event; func (rt *Runtime) PollStable(ctx) []autoload.Event
+func (rt *Runtime) ArtifactState(pluginID string) (path, hash string, ok bool)
+func (rt *Runtime) ArtifactPath(pluginID string) (string, bool)
+func (rt *Runtime) Reload(ctx, pluginID string) ([]autoload.Event, error)
 func CheckDirs(ctx, dirs []string) []error   // 离线校验
 ```
 
@@ -309,10 +342,11 @@ mount RemoteSpec.dispatch_concurrency 可覆盖):慢 op 不队头阻塞、同会
 超额立即回执 busy 背压;请求处理不保序、插件侧 PluginOps 回调可能并发
 (与进程内插件一致,须线程安全)。
 
-## schema（JSON Schema 子集）
+## schema（JSON Schema draft 2020-12）
 
 ```go
-func Validate(schema, value json.RawMessage, root string) []string  // 通用校验(空=通过)
+func Validate(schema, value json.RawMessage, root string) []string  // draft 2020-12 完整校验(空 schema=通过)
+func ValidateDocument(document json.RawMessage) error              // 只编译校验 schema 文档
 func ValidateConfig(schema, cfg json.RawMessage) []string           // = Validate(root="config")
 func Register(name, doc string, proto any)                          // 预设结构目录
 func Entries() []Entry; func LookupEntry(name) (Entry, bool)
@@ -321,8 +355,8 @@ func ValidateMin(name string, payload json.RawMessage) error
 func RequiredFields(name string) []string
 ```
 
-校验支持：`object/properties/required`、`array/items`、`string`（含 `enum`）、
-`integer`、`number`、`boolean`、`type` 数组（联合）、`anyOf`。
+支持 draft 2020-12 与本地 `#/$defs` 引用；任何外部 schema 资源都在编译期拒绝，
+不会为校验读取文件或访问网络。数字按 `json.Number` 解码，避免大整数精度与类型判定失真。
 
 ## undo / exchange
 

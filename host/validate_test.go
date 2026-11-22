@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -73,6 +74,25 @@ func TestCallValidatesOutputSchema(t *testing.T) {
 	_, err := h.Call(context.Background(), "vf.out", "n", json.RawMessage(`{}`))
 	if err == nil || !strings.Contains(err.Error(), "output") {
 		t.Fatalf("bad output should be rejected: %v", err)
+	}
+}
+
+func TestCallValidationErrorDetail(t *testing.T) {
+	h := New[any](Options[any]{})
+	if err := h.Register(schemaFunc{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h.Call(context.Background(), "vf.add", "add", json.RawMessage(`{"a":"x"}`))
+	if err == nil {
+		t.Fatal("invalid input must fail")
+	}
+	detail, ok := contract.ErrorDetailOf(err)
+	if !ok || detail.Code != "schema.input.invalid" || detail.Phase != "input" || detail.Plugin != "vf.add" || detail.Fn != "add" || detail.Path != "input" || detail.Retryable {
+		t.Fatalf("structured error = %+v, ok=%v", detail, ok)
+	}
+	var typed *contract.CallError
+	if !errors.As(err, &typed) {
+		t.Fatalf("CallError type was not preserved: %T", err)
 	}
 }
 

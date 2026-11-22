@@ -15,6 +15,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/ejfkdev/egop/autoload"
 	"github.com/ejfkdev/egop/contract"
 	"github.com/ejfkdev/egop/host"
 	"github.com/ejfkdev/egop/loader"
@@ -328,6 +329,43 @@ func TestMountFailureFullUnwind(t *testing.T) {
 	if !h.HasPlugin("pre.existing") {
 		t.Fatal("pre-existing plugin must survive mount failure cleanup")
 	}
+}
+
+func TestMountRuntimePollAndReload(t *testing.T) {
+	hf, h := mountHost(t)
+	dir := t.TempDir()
+	rt, _, err := Mount(context.Background(), hf, Sources{Dirs: []string{dir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	path := writeZip(t, dir, "demo.egop.zip", demoManifest, demoModule(t))
+	if evs := rt.PollStable(context.Background()); !hasMountAction(evs, "register") || !h.HasPlugin("wasm.demo") {
+		t.Fatalf("stable poll should complete both confirmation rounds: %v", evs)
+	}
+	evs, err := rt.Reload(context.Background(), "wasm.demo")
+	if err != nil || !hasMountAction(evs, "replace") {
+		t.Fatalf("Reload events=%v err=%v", evs, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if evs := rt.Poll(context.Background()); hasMountAction(evs, "remove") || !h.HasPlugin("wasm.demo") {
+		t.Fatalf("first missing poll must not remove: %v", evs)
+	}
+	if evs := rt.Poll(context.Background()); !hasMountAction(evs, "remove") || h.HasPlugin("wasm.demo") {
+		t.Fatalf("second missing poll should remove: %v", evs)
+	}
+}
+
+func hasMountAction(evs []autoload.Event, want autoload.Action) bool {
+	for _, ev := range evs {
+		if ev.Action == want {
+			return true
+		}
+	}
+	return false
 }
 
 // prePlug 是装配前已在册的最小插件(全清边界断言用)。

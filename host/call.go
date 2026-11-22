@@ -26,13 +26,27 @@ func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.R
 	}
 	h.mu.Lock()
 	e, ok := h.fns[pluginID+"."+fname]
+	if ok && !h.acquireGenerationLocked(e.generation) {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("host: plugin %s: function %q: old generation is retiring", pluginID, fname)
+	}
 	h.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("host: plugin %s: function %q not registered", pluginID, fname)
 	}
+	// lease 覆盖输入/输出校验与整个插件调用；Replace/Remove 封闭旧代后
+	// 必须等此处 release，不能仅凭插件 Busy 探测提前清退 effect。
+	defer h.releaseGeneration(e.generation)
 	if !h.opts.DisableFuncValidation && len(e.spec.Input) > 0 {
-		if issues := schema.Validate(e.spec.Input, input, "input"); len(issues) > 0 {
-			err = fmt.Errorf("host: plugin %s: function %q: %s", pluginID, fname, strings.Join(issues, "; "))
+		trimmed := strings.TrimSpace(string(input))
+		if trimmed != "" && trimmed != "null" {
+			if issues := schema.Validate(e.spec.Input, input, "input"); len(issues) > 0 {
+				err = contract.NewCallError(contract.ErrorDetail{
+					Code: "schema.input.invalid", Phase: "input", Plugin: pluginID, Fn: fname,
+					Path: "input", Retryable: false,
+					Message: fmt.Sprintf("host: plugin %s: function %q: %s", pluginID, fname, strings.Join(issues, "; ")),
+				})
+			}
 		}
 	}
 	if err == nil {
@@ -40,7 +54,11 @@ func (h *Host[C]) Call(ctx context.Context, pluginID, fname string, input json.R
 	}
 	if err == nil && !h.opts.DisableFuncValidation && len(e.spec.Output) > 0 {
 		if issues := schema.Validate(e.spec.Output, out, "output"); len(issues) > 0 {
-			err = fmt.Errorf("host: plugin %s: function %q: %s", pluginID, fname, strings.Join(issues, "; "))
+			err = contract.NewCallError(contract.ErrorDetail{
+				Code: "schema.output.invalid", Phase: "output", Plugin: pluginID, Fn: fname,
+				Path: "output", Retryable: false,
+				Message: fmt.Sprintf("host: plugin %s: function %q: %s", pluginID, fname, strings.Join(issues, "; ")),
+			})
 			out = nil
 		}
 	}
@@ -69,18 +87,8 @@ func (h *Host[C]) setConfig(pluginID string, cfg json.RawMessage) (err error) {
 	if !ok {
 		return fmt.Errorf("host: plugin %s: not configurable", pluginID)
 	}
-	if len(m.Provides.Config) > 0 {
-		pairs := make([]schema.ConfigPair, 0, len(m.Provides.Config))
-		for _, f := range m.Provides.Config {
-			if len(f.Schema) > 0 {
-				pairs = append(pairs, schema.ConfigPair{Key: f.Key, Schema: f.Schema})
-			}
-		}
-		if len(pairs) > 0 {
-			if issues := schema.ValidateConfig(schema.BuildConfigSchema(pairs), cfg); len(issues) > 0 {
-				return fmt.Errorf("host: plugin %s: config: %s", pluginID, strings.Join(issues, "; "))
-			}
-		}
+	if err := validateConfigForMeta(pluginID, m, cfg); err != nil {
+		return err
 	}
 	if err := c.ApplyConfig(cfg); err != nil {
 		return fmt.Errorf("host: plugin %s: %w", pluginID, err)
@@ -111,6 +119,27 @@ func (h *Host[C]) setConfig(pluginID string, cfg json.RawMessage) (err error) {
 			Source:  &contract.Origin{Kind: contract.OriginHost, At: time.Now().UnixMilli()},
 			Payload: payload,
 		})
+	}
+	return nil
+}
+
+// validateConfigForMeta 同时服务 SetConfig 与 Replace 配置回灌。旧配置曾在
+// 旧 Meta 下合法，不代表它满足新版本的 Config Schema；回灌必须先重验。
+func validateConfigForMeta(pluginID string, m contract.Meta, cfg json.RawMessage) error {
+	if len(m.Provides.Config) == 0 {
+		return nil
+	}
+	pairs := make([]schema.ConfigPair, 0, len(m.Provides.Config))
+	for _, f := range m.Provides.Config {
+		if len(f.Schema) > 0 {
+			pairs = append(pairs, schema.ConfigPair{Key: f.Key, Schema: f.Schema})
+		}
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	if issues := schema.ValidateConfig(schema.BuildConfigSchema(pairs), cfg); len(issues) > 0 {
+		return fmt.Errorf("host: plugin %s: config: %s", pluginID, strings.Join(issues, "; "))
 	}
 	return nil
 }
@@ -174,10 +203,11 @@ func (h *Host[C]) configFieldAllowed(pluginID, key string, read bool) bool {
 
 // Tools 包装声明 CapTools 的 ToolProvider[C] 为 Tool 适配。
 type Tool[C any] struct {
-	Spec     contract.FuncSpec
-	run      contract.ToolFunc[C]
-	pluginID string
-	host     *Host[C]
+	Spec       contract.FuncSpec
+	run        contract.ToolFunc[C]
+	pluginID   string
+	host       *Host[C]
+	generation *pluginGeneration
 }
 
 func (t *Tool[C]) Info() contract.FuncSpec { return t.Spec }
@@ -190,6 +220,7 @@ func (h *Host[C]) Tools() []Tool[C] {
 	type row struct {
 		id string
 		tp contract.ToolProvider[C]
+		g  *pluginGeneration
 	}
 	h.mu.Lock()
 	rows := make([]row, 0, len(h.plugins))
@@ -198,7 +229,7 @@ func (h *Host[C]) Tools() []Tool[C] {
 		if !ok || !contract.HasCapability(h.meta[id], contract.CapTools) {
 			continue
 		}
-		rows = append(rows, row{id: id, tp: tp})
+		rows = append(rows, row{id: id, tp: tp, g: h.generations[id]})
 	}
 	h.mu.Unlock()
 	var out []Tool[C]
@@ -208,7 +239,7 @@ func (h *Host[C]) Tools() []Tool[C] {
 			defer func() { _ = recover() }()
 			for _, spec := range r.tp.ToolSpecs() {
 				if fn, ok := r.tp.Tool(spec.Name); ok {
-					out = append(out, Tool[C]{Spec: spec, run: fn, pluginID: r.id, host: h})
+					out = append(out, Tool[C]{Spec: spec, run: fn, pluginID: r.id, host: h, generation: r.g})
 				}
 			}
 		}()
@@ -221,8 +252,17 @@ func (h *Host[C]) Tools() []Tool[C] {
 }
 
 // Run 执行工具（返回字符串形态,供模型面直用）。插件工具 panic 归一到 error。
+// 收集时绑定 generation：Replace/Remove 后旧 Tool 不能绕开准入继续启动；
+// 已启动的 Run 与 Host.Call 一样持有 lease，直到工具返回才释放。
 func (t *Tool[C]) Run(ctx context.Context, tc *C, args json.RawMessage) (s string, err error) {
 	defer fromPanic(&err, fmt.Sprintf("tool %q", t.Spec.Name))
+	t.host.mu.Lock()
+	if !t.host.acquireGenerationLocked(t.generation) {
+		t.host.mu.Unlock()
+		return "", fmt.Errorf("host: plugin %s: tool %q: old generation is retiring", t.pluginID, t.Spec.Name)
+	}
+	t.host.mu.Unlock()
+	defer t.host.releaseGeneration(t.generation)
 	var out json.RawMessage
 	out, err = t.run(ctx, tc, args)
 	if err != nil {

@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,6 +170,27 @@ func TestPoolEventPinnedToPrimary(t *testing.T) {
 	}
 }
 
+func TestPoolHookPinnedToPrimary(t *testing.T) {
+	h, _ := coreHost(t)
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	if err := h.Register(p); err != nil {
+		t.Fatal(err)
+	}
+	count := func() int {
+		return len(h.TriggerHook(context.Background(), "demo.hook", json.RawMessage(`{}`)))
+	}
+	if before := count(); before != 1 {
+		t.Fatalf("baseline hook registrations = %d, want 1", before)
+	}
+	if err := p.growPool(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if after := count(); after != 1 {
+		t.Fatalf("secondary instance registered a duplicate hook callback: got %d, want 1", after)
+	}
+}
+
 // TestNestedSelfCallEndToEnd 端到端嵌套自调用:guest 经宿主 call 注入回调
 // **本插件**(同 goroutine 重入)。验证两件事:① ctx 重入标记跨 wazero 透传
 // (不透传则嵌套 acquire 永挂、本测试超时);② 池=1 立即 busy 回落、池=2 取
@@ -224,5 +246,318 @@ func TestPoolConcurrentCalls(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatalf("concurrent CallFunc: %v", err)
 		}
+	}
+}
+
+// TestGuestDeathSelfHeal guest 自发死亡(module closed,非 ctx 看门狗路径)不再
+// 永久僵死插件:死亡当次调用如实报错(fail-closed)且实例置 broken,下一次调用
+// revive 重建自愈。此前 callCore 只在看门狗中断路径置 broken——guest 自发
+// exit(如 exit_code(4))/trap 后实例永不自愈,插件僵死到宿主重启
+// (eha longrun 生产事故实锤,七十五阶修)。
+func TestGuestDeathSelfHeal(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	if _, err := p.CallFunc(context.Background(), "add", nil); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	i := p.insts[0]
+	i.mu.Lock()
+	_ = i.mod.CloseWithExitCode(context.Background(), 4)
+	i.mu.Unlock()
+	// 死亡当次:调用如实报错,且置 broken(revive 前提)。
+	if _, err := p.CallFunc(context.Background(), "add", nil); err == nil {
+		t.Fatal("死实例调用应报错(fail-closed)")
+	}
+	if !i.broken.Load() {
+		t.Fatal("非 ctx 取消的调用错误应置 broken(否则永不 revive)")
+	}
+	// 下一次调用:revive 重建,插件自愈。
+	if _, err := p.CallFunc(context.Background(), "add", nil); err != nil {
+		t.Fatalf("revive 应自愈: %v", err)
+	}
+}
+
+// TestPoolAcquireFIFOFairness 公平性回归锁(2026-10-15 eha 跑分实锤:纯
+// TryLock 自旋无 FIFO,长阻塞轮次持实例时新到者无限插队,先到等待者饥饿
+// 35+ 分钟)。语义:排队者按入队序获得交接;释放优先递队首而非新到者。
+func TestPoolAcquireFIFOFairness(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	ctx := context.Background()
+	held, err := p.acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := make(chan string, 4)
+	waiter := func(name string, ready chan<- string) {
+		ready <- name
+		i, err := p.acquire(ctx)
+		if err != nil {
+			t.Errorf("%s acquire: %v", name, err)
+			order <- name + ":err"
+			return
+		}
+		order <- name
+		time.Sleep(5 * time.Millisecond)
+		p.release(i)
+	}
+	// B 先排队,C 后排队;释放后必须 B 先拿到(旧实现下 C 可插队)。
+	rb := make(chan string, 1)
+	rc := make(chan string, 1)
+	go waiter("B", rb)
+	<-rb
+	time.Sleep(30 * time.Millisecond) // 确保 B 已入队
+	go waiter("C", rc)
+	<-rc
+	time.Sleep(30 * time.Millisecond) // 确保 C 已入队(B 在前)
+	// 交接开始:D 在释放瞬间抢跑也排不到 B/C 前面。
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		i, err := p.acquire(ctx)
+		if err == nil {
+			order <- "D"
+			p.release(i)
+		}
+	}()
+	p.release(held)
+	got := []string{<-order, <-order, <-order}
+	if got[0] != "B" || got[1] != "C" {
+		t.Fatalf("FIFO 违约: %v (期望 B,C 先于 D)", got)
+	}
+}
+
+func TestPoolCanceledHandoffReleasesToNextWaiter(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	held, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondDone := make(chan *inst, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		i, err := p.acquire(context.Background())
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		secondDone <- i
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.waitMu.Lock()
+		queued := len(p.waiters)
+		p.waitMu.Unlock()
+		if queued == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second waiter did not enqueue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Model the cancellation race deterministically: the canceled first waiter
+	// has already been popped and handed the locked instance, while a real
+	// second waiter remains queued behind it.
+	first := make(chan *inst, 1)
+	p.waitMu.Lock()
+	p.waiters = append([]chan *inst{first}, p.waiters...)
+	p.waiters = p.waiters[1:]
+	first <- held
+	p.waitMu.Unlock()
+	p.cancelWaiter(first)
+
+	select {
+	case i := <-secondDone:
+		if i != held {
+			t.Fatal("remaining waiter received a different instance")
+		}
+		p.release(i)
+	case err := <-secondErr:
+		t.Fatalf("remaining waiter: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("canceled FIFO winner stranded the remaining waiter")
+	}
+}
+
+// TestPoolCloseWakesWaiters Close 唤醒排队者(收关闭错误,不挂死)。
+func TestPoolCloseWakesWaiters(t *testing.T) {
+	p := mustLoad(t)
+	ctx := context.Background()
+	held, err := p.acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := make(chan error, 1)
+	go func() {
+		_, err := p.acquire(context.Background())
+		res <- err
+	}()
+	time.Sleep(30 * time.Millisecond) // 等待者已入队
+	go p.Close(context.Background())
+	select {
+	case err := <-res:
+		if err == nil {
+			t.Fatal("排队者应收关闭错误")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 未唤醒排队者(挂死)")
+	}
+	_ = held
+}
+
+// TestToolSpecsNonBlockingWhenBusy 元数据查询不得排在长调用后面(2026-10-31):
+// 实例被整轮占用时 ToolSpecs 必须立即回快照/清单,而非烧满 10s 超时(旧实现
+// 每次 eha agent 启动会被 LLM/react 忙插件各拖 10s)。
+func TestToolSpecsNonBlockingWhenBusy(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	// 预热:空闲时查询(清单快照,无 export 时回 manifest)。
+	if specs := p.ToolSpecs(); len(specs) == 0 || specs[0].Name != "answer" {
+		t.Fatalf("idle specs = %+v", specs)
+	}
+	ctx := context.Background()
+	i, err := p.acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	specs := p.ToolSpecs()
+	elapsed := time.Since(start)
+	p.release(i)
+	if len(specs) == 0 || specs[0].Name != "answer" {
+		t.Fatalf("busy specs = %+v", specs)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ToolSpecs blocked %v while instance busy (must be non-blocking)", elapsed)
+	}
+	p.waitMu.Lock()
+	nWait := len(p.waiters)
+	p.waitMu.Unlock()
+	if nWait != 0 {
+		t.Fatalf("ToolSpecs enqueued %d waiter(s); metadata must never queue", nWait)
+	}
+}
+
+func TestPoolBusyWhenAnyInstanceActive(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	if err := p.growPool(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	i, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := p.Busy()
+	p.release(i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !busy {
+		t.Fatal("one active instance must make the pool busy even when another is idle")
+	}
+}
+
+func TestCloseDeadlineInterruptsBlockedCall(t *testing.T) {
+	module, err := os.ReadFile(filepath.Join("testdata", "blocked.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	p, err := LoadFS(context.Background(), buildZip(t,
+		`{"id":"wasm.blocked","name":"Blocked","version":"1","provides":{"functions":[{"name":"block"}]}}`, module),
+		"blocked.egop.zip", Options{LogFn: func(_, msg string) {
+			if msg == "started" {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if p.runtime != nil {
+			_ = p.runtime.CloseWithExitCode(context.Background(), 255)
+		}
+		_ = p.Close(context.Background())
+	})
+
+	callDone := make(chan error, 1)
+	go func() {
+		_, err := p.CallFunc(context.Background(), "block", nil)
+		callDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked call did not enter the guest")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- p.Close(ctx) }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close returned an error after interrupting the call: %v", err)
+		}
+	case <-time.After(time.Second):
+		_ = p.runtime.CloseWithExitCode(context.Background(), 255)
+		select {
+		case <-closeDone:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("Close remained blocked on the active instance past its context deadline")
+	}
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatal("forcibly interrupted call must return an error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupted call did not return")
+	}
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("second Close must be safe: %v", err)
+	}
+}
+
+func TestCloseDeadlineBoundsUninterruptibleInstance(t *testing.T) {
+	p := mustLoad(t)
+	i, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- p.Close(ctx) }()
+	var closeErr error
+	timedOut := false
+	select {
+	case closeErr = <-closeDone:
+	case <-time.After(time.Second):
+		timedOut = true
+	}
+	elapsed := time.Since(started)
+	p.release(i)
+	if timedOut {
+		t.Fatal("Close did not observe its context while the instance lock stayed held")
+	}
+	if !errors.Is(closeErr, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline", closeErr)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Close returned after %v, well past its 40ms deadline", elapsed)
+	}
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("second Close must be safe: %v", err)
 	}
 }

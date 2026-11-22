@@ -17,6 +17,7 @@ import (
 
 	"github.com/ejfkdev/egop/contract"
 	"github.com/ejfkdev/egop/host"
+	"github.com/tetratelabs/wazero/api"
 )
 
 // facesFS 是全局文件系统注入后端(内存假实现)。
@@ -72,6 +73,132 @@ func (facesNet) Request(_ context.Context, req contract.Request) (*contract.Resp
 
 func (facesNet) DialStream(context.Context, string, map[string]string) (contract.Stream, error) {
 	return nil, io.ErrUnexpectedEOF
+}
+
+type legacyGuardSurface struct {
+	contract.Surface
+	net     contract.Net
+	persist contract.FileStore
+	kv      contract.KeyValue
+}
+
+func (s legacyGuardSurface) Net() (contract.Net, bool) { return s.net, s.net != nil }
+func (s legacyGuardSurface) Persist() (contract.FileStore, bool) {
+	return s.persist, s.persist != nil
+}
+func (s legacyGuardSurface) KV() (contract.KeyValue, bool) { return s.kv, s.kv != nil }
+
+type countingLegacyNet struct{ calls int }
+
+func (n *countingLegacyNet) Request(context.Context, contract.Request) (*contract.Response, error) {
+	n.calls++
+	return nil, io.ErrUnexpectedEOF
+}
+func (n *countingLegacyNet) DialStream(context.Context, string, map[string]string) (contract.Stream, error) {
+	return nil, io.ErrUnexpectedEOF
+}
+
+type staticLegacyFileStore struct{ data []byte }
+
+func (s staticLegacyFileStore) Read(string) ([]byte, error) { return s.data, nil }
+func (staticLegacyFileStore) Write(string, []byte) error    { return nil }
+func (staticLegacyFileStore) Append(string, []byte) error   { return nil }
+func (staticLegacyFileStore) List() ([]string, error)       { return nil, nil }
+
+type staticLegacyKV struct{ data []byte }
+
+func (s staticLegacyKV) Get(string) ([]byte, bool) { return s.data, true }
+func (staticLegacyKV) Put(string, []byte)          {}
+func (staticLegacyKV) Delete(string)               {}
+func (staticLegacyKV) Keys() []string              { return nil }
+
+func legacyGuardPlugin(surface contract.Surface) *Plugin {
+	p := newPlugin("legacy-guard")
+	p.surfacePtr.Store(&surface)
+	return p
+}
+
+func legacyGuardHostOp(name string) hostOp {
+	for _, op := range hostOps {
+		if op.name == name {
+			return op
+		}
+	}
+	panic("missing host op " + name)
+}
+
+func TestLegacyNetRequestRejectsOversizedDecodedBody(t *testing.T) {
+	backend := &countingLegacyNet{}
+	p := legacyGuardPlugin(legacyGuardSurface{net: backend})
+	decodedLen := MaxNetBodyBytes + 1
+	body := strings.Repeat("A", 4*((decodedLen+2)/3))
+	input, err := json.Marshal(map[string]any{
+		"method": "POST", "url": "https://example.invalid", "body_b64": body,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := legacyGuardHostOp(ImportNetRequest).run(context.Background(), nil, p, []string{string(input)})
+	if backend.calls != 0 {
+		t.Fatalf("oversized body reached the network backend %d time(s)", backend.calls)
+	}
+	if res.err == nil || !strings.Contains(res.err.Error(), "exceeds ABI guard") {
+		t.Fatalf("oversized decoded body error = %v", res.err)
+	}
+}
+
+func TestLegacyBase64DecodedLenAccountsForPaddingAndNewlines(t *testing.T) {
+	for _, raw := range [][]byte{{1}, {1, 2}, {1, 2, 3}} {
+		encoded := base64.StdEncoding.EncodeToString(raw)
+		if got := legacyBase64DecodedLen(encoded); got != len(raw) {
+			t.Fatalf("decoded length for %x = %d, want %d", raw, got, len(raw))
+		}
+		withNewlines := encoded[:2] + "\r\n" + encoded[2:]
+		if got := legacyBase64DecodedLen(withNewlines); got != len(raw) {
+			t.Fatalf("decoded length with newlines for %x = %d, want %d", raw, got, len(raw))
+		}
+	}
+}
+
+func TestLegacyPersistAndKVReadsEnforceDecodedSizeGuard(t *testing.T) {
+	oversized := make([]byte, MaxBinaryReadBytes+1)
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	var surface contract.Surface = legacyGuardSurface{
+		persist: staticLegacyFileStore{data: oversized},
+		kv:      staticLegacyKV{data: oversized},
+	}
+	p.surfacePtr.Store(&surface)
+	module := p.insts[0].mod
+	for _, tc := range []struct {
+		op   string
+		args []string
+	}{
+		{op: ImportPersistRead, args: []string{"large"}},
+		{op: ImportKVGet, args: []string{"large"}},
+	} {
+		res := legacyGuardHostOp(tc.op).run(context.Background(), module, p, tc.args)
+		if res.err == nil || !strings.Contains(res.err.Error(), "exceeds ABI guard") {
+			t.Fatalf("%s oversized result error = %v", tc.op, res.err)
+		}
+	}
+}
+
+func TestInvalidGuestPointerDoesNotRunHostOp(t *testing.T) {
+	p := mustLoad(t)
+	defer p.Close(context.Background())
+	called := false
+	op := hostOp{name: "invalid_pointer_test", pairs: 1, run: func(context.Context, api.Module, *Plugin, []string) hostOpResult {
+		called = true
+		return okRes(nil)
+	}}
+	res := runHostOpDecoded(context.Background(), p.insts[0].mod, p, op, []uint64{uint64(^uint32(0)), 1})
+	if called {
+		t.Fatal("host operation ran with an invalid guest pointer")
+	}
+	if res.err == nil || !strings.Contains(res.err.Error(), "guest pointer out of range") {
+		t.Fatalf("invalid guest pointer error = %v", res.err)
+	}
 }
 
 // callerPlug 是进程内调用方插件(plugin.call):经 Surface.Call 打 wasm.faces,

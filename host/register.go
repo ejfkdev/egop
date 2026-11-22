@@ -44,22 +44,29 @@ func (h *Host[C]) Register(p contract.Plugin) (err error) {
 }
 
 // initDepsSatisfiedLocked 判定插件的 DepInit 依赖(点名或点槽位)是否已全部满足。
-// 需持 h.mu。
-func (h *Host[C]) initDepsSatisfiedLocked(m contract.Meta) bool {
+// Plugin/Slot 双设时统一采用 Slot 优先（Register/Replace/Remove/RegisterMany
+// 同规则）；Slot 依赖不使用 MinVersion。需持 h.mu；prospective 用于 Replace
+// 在拟提交目录上预检，省略时读当前 h.meta。
+func (h *Host[C]) initDepsSatisfiedLocked(m contract.Meta, prospective ...map[string]contract.Meta) bool {
+	registry := h.meta
+	if len(prospective) > 0 {
+		registry = prospective[0]
+	}
 	for _, r := range m.Requires.Deps {
 		if r.Kind != contract.DepInit {
 			continue
 		}
 		if r.Slot != "" {
-			if !h.slotSatisfiedLocked(r.Slot) {
+			if !h.slotSatisfiedLocked(r.Slot, registry) {
 				return false
 			}
 			continue
 		}
-		if _, ok := h.plugins[r.Plugin]; !ok {
+		dependency, ok := registry[r.Plugin]
+		if !ok {
 			return false
 		}
-		if r.MinVersion != "" && !versionAtLeast(h.meta[r.Plugin].Version, r.MinVersion) {
+		if r.MinVersion != "" && !versionAtLeast(dependency.Version, r.MinVersion) {
 			return false
 		}
 	}
@@ -76,26 +83,70 @@ func hasBadNameChars(s string) bool {
 	return false
 }
 
-// versionAtLeast 极简语义化版本比较:按 "." 拆段逐段比数字(缺省段视 0)。非纯数字
-// 段按字典序兜底。只用于 DepInit 依赖 MinVersion 的机器校验,非完整 semver。
+// parseNumericVersion 解析点分十进制版本。每段都必须是非空纯数字;
+// 溢出、空段和其它字符一律报错,不能静默当成零参与依赖比较。
+func parseNumericVersion(s string) ([]int, error) {
+	if s == "" {
+		return nil, errors.New("empty version")
+	}
+	parts := strings.Split(s, ".")
+	out := make([]int, len(parts))
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("version segment %d is empty", i+1)
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return nil, fmt.Errorf("version segment %q is not numeric", part)
+			}
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("version segment %q: %w", part, err)
+		}
+		out[i] = n
+	}
+	return out, nil
+}
+
+// versionAtLeast 极简语义化版本比较:按 "." 拆段逐段比数字(缺省段视 0)。
+// 任一侧含非法段时比较失败;MinVersion 自身还会由 validateMinVersionConstraints
+// 返回带上下文的注册错误。只用于 DepInit 依赖,非完整 semver。
 func versionAtLeast(got, want string) bool {
 	if want == "" {
 		return true
 	}
-	g := strings.Split(got, ".")
-	w := strings.Split(want, ".")
+	g, err := parseNumericVersion(got)
+	if err != nil {
+		return false
+	}
+	w, err := parseNumericVersion(want)
+	if err != nil {
+		return false
+	}
 	for i := range w {
 		gi := 0
-		wi := 0
 		if i < len(g) {
-			gi, _ = strconv.Atoi(strings.TrimSpace(g[i]))
+			gi = g[i]
 		}
-		wi, _ = strconv.Atoi(strings.TrimSpace(w[i]))
-		if gi != wi {
-			return gi > wi
+		if gi != w[i] {
+			return gi > w[i]
 		}
 	}
 	return true
+}
+
+func validateMinVersionConstraints(m contract.Meta) error {
+	for _, r := range m.Requires.Deps {
+		if r.Kind != contract.DepInit || r.Slot != "" || r.MinVersion == "" {
+			continue
+		}
+		if _, err := parseNumericVersion(r.MinVersion); err != nil {
+			return fmt.Errorf("host: plugin %s: invalid min_version %q for init-dependency %q: %w", m.ID, r.MinVersion, r.Plugin, err)
+		}
+	}
+	return nil
 }
 
 // RegisterStatus 是 RegisterLazy 的注册结果(显式区分"已加载 / 待补载")。
@@ -115,11 +166,14 @@ func (s RegisterStatus) String() string {
 
 // RegisterLazy 登记插件:init 依赖已满足则立即注册(StatusRegistered);否则进待补载
 // 队列(StatusPending),待后续 Register/RegisterMany/Replace 使依赖到位时自动补载。
-// 仅空 id、与在册插件重复 id 才返回错误。重复懒登记同 id 会更新待补载实现。
+// 空 id、非法 MinVersion、与在册插件重复 id 返回错误。重复懒登记同 id 会更新待补载实现。
 func (h *Host[C]) RegisterLazy(p contract.Plugin) (RegisterStatus, error) {
-	m := p.Meta()
+	m := contract.CloneMeta(p.Meta())
 	if m.ID == "" {
 		return StatusRegistered, errors.New("host: empty id rejected")
+	}
+	if err := validateMinVersionConstraints(m); err != nil {
+		return StatusRegistered, err
 	}
 	h.mu.Lock()
 	if _, ok := h.plugins[m.ID]; ok {
@@ -131,41 +185,45 @@ func (h *Host[C]) RegisterLazy(p contract.Plugin) (RegisterStatus, error) {
 		return StatusRegistered, h.Register(p)
 	}
 	if _, ok := h.pendingPlugins[m.ID]; ok {
-		// 已在待补载:替换成最新实现(幂等更新),仍返回 Pending。
+		// 已在待补载:替换成最新实现与不可变 Meta 快照(幂等更新),仍返回 Pending。
 		h.pendingPlugins[m.ID] = p
+		h.pendingMeta[m.ID] = m
 		h.mu.Unlock()
 		return StatusPending, nil
 	}
 	h.pendingPlugins[m.ID] = p
+	h.pendingMeta[m.ID] = m
 	h.pending = append(h.pending, m.ID)
 	h.mu.Unlock()
 	h.logf("host: plugin %s deferred (init deps pending)", m.ID)
 	return StatusPending, nil
 }
 
-// retryPending 宿主进册新插件后,重试待补载的懒插件:依赖到位即自动注册,仍缺
-// 依赖者留在队列,其它硬失败(契约/重复等)记日志后丢弃。递归而不无限——每轮
-// 至少移除一条"就绪"项,或原地终止。
+// retryPending 重试待补载插件。锁内只读 pendingPlugins 与 RegisterLazy 保存的
+// CloneMeta 快照，绝不调用外部 Meta；Register 成功提交时才移除 pending。
+// 硬失败保留 pending，后续依赖/目录变化仍可重试，且不会遗留函数目录半成品。
 func (h *Host[C]) retryPending() {
+	type readyPlugin struct {
+		p  contract.Plugin
+		id string
+	}
 	h.mu.Lock()
-	var ready []contract.Plugin
-	kept := make([]string, 0, len(h.pending))
+	var ready []readyPlugin
 	for _, id := range h.pending {
-		p := h.pendingPlugins[id]
-		if h.initDepsSatisfiedLocked(p.Meta()) {
-			ready = append(ready, p)
-			delete(h.pendingPlugins, id)
-		} else {
-			kept = append(kept, id)
+		p, ok := h.pendingPlugins[id]
+		if !ok {
+			continue
+		}
+		m := h.pendingMeta[id]
+		if h.initDepsSatisfiedLocked(m) {
+			ready = append(ready, readyPlugin{p: p, id: id})
 		}
 	}
-	h.pending = kept
 	h.mu.Unlock()
-	for _, p := range ready {
-		if err := h.Register(p); err != nil {
-			id := p.Meta().ID
-			h.logf("host: deferred plugin %s failed: %v", id, err)
-			h.emitPluginFailed(id, err)
+	for _, r := range ready {
+		if err := h.Register(r.p); err != nil {
+			h.logf("host: deferred plugin %s failed: %v", r.id, err)
+			h.emitPluginFailed(r.id, err)
 		}
 	}
 }
@@ -190,6 +248,7 @@ func (h *Host[C]) removePendingLocked(id string) {
 		return
 	}
 	delete(h.pendingPlugins, id)
+	delete(h.pendingMeta, id)
 	for i, pid := range h.pending {
 		if pid == id {
 			h.pending = append(h.pending[:i], h.pending[i+1:]...)
@@ -198,14 +257,18 @@ func (h *Host[C]) removePendingLocked(id string) {
 	}
 }
 
-// validateContractLocked 校验插件的契约前提:名称/依赖形状、DepInit 依赖已就位
-// (点名/槽位/版本) + 槽位八轴最小契约满足。Register 与 Replace 共用——热替换
-// 不得比首次注册宽松,否则坏包可绕过契约从替换口进入。需持 h.mu。
-func (h *Host[C]) validateContractLocked(m contract.Meta) error {
-	// 名称字符约束:插件 id 与函数名进入目录/函数键空间("id.fn"),注册口单点
-	// fail-closed——"." 是键空间分隔符不允许出现在函数名(否则插件 a 的函数 "b.c"
-	// 与插件 "a.b" 的函数 "c" 撞键),空白/控制字符一律拒(保留 id 含点:vendor.name
-	// 命名惯例合法)。
+// validateContractLocked 校验名称/依赖形状、DepInit(点名/槽位/版本)与槽位
+// 八轴最小契约。prospective 非空时在拟提交 Meta 目录上校验；当前与拟提交
+// 目录共用同一 Slot 优先规则。需持 h.mu。
+func (h *Host[C]) validateContractLocked(m contract.Meta, prospective ...map[string]contract.Meta) error {
+	registry := h.meta
+	if len(prospective) > 0 {
+		registry = prospective[0]
+	}
+	if err := validateMinVersionConstraints(m); err != nil {
+		return err
+	}
+	// 名称字符约束:插件 id 与函数名进入目录/函数键空间("id.fn")。
 	if hasBadNameChars(m.ID) {
 		return fmt.Errorf("host: plugin %q: id must not contain whitespace or control characters", m.ID)
 	}
@@ -223,21 +286,23 @@ func (h *Host[C]) validateContractLocked(m contract.Meta) error {
 		if r.Kind != contract.DepInit {
 			continue
 		}
+		// 双设依赖统一 Slot 优先；MinVersion 只属于点名插件依赖。
 		if r.Slot != "" {
-			if !h.slotSatisfiedLocked(r.Slot) {
+			if !h.slotSatisfiedLocked(r.Slot, registry) {
 				return fmt.Errorf("host: plugin %s: init-dependency slot %q not satisfied", m.ID, r.Slot)
 			}
 			continue
 		}
-		if _, ok := h.plugins[r.Plugin]; !ok {
+		dependency, ok := registry[r.Plugin]
+		if !ok {
 			return fmt.Errorf("host: plugin %s: init-dependency %q not registered", m.ID, r.Plugin)
 		}
-		if r.MinVersion != "" && !versionAtLeast(h.meta[r.Plugin].Version, r.MinVersion) {
-			return fmt.Errorf("host: plugin %s: init-dependency %q version %q < required %q", m.ID, r.Plugin, h.meta[r.Plugin].Version, r.MinVersion)
+		if r.MinVersion != "" && !versionAtLeast(dependency.Version, r.MinVersion) {
+			return fmt.Errorf("host: plugin %s: init-dependency %q version %q < required %q", m.ID, r.Plugin, dependency.Version, r.MinVersion)
 		}
 	}
 	if m.Slot != "" {
-		_, ok, miss := h.slotCheck(m)
+		_, ok, miss := h.slotCheck(m, registry)
 		if !ok {
 			return fmt.Errorf("host: plugin %s: unknown slot %q", m.ID, m.Slot)
 		}
@@ -248,28 +313,74 @@ func (h *Host[C]) validateContractLocked(m contract.Meta) error {
 	return nil
 }
 
+// validateProspectiveReplaceLocked 在“id 已被新版本占据”的完整拟提交目录
+// 上重验所有在册插件，而不仅是替换件自身。这样版本降级、Slot 撤离/变化、
+// SlotSpec.Needs 失联等会让任意既有依赖悬空的热更都会在 prepare 前被拒绝。
+// ValidateProspective 在“候选清单已占据其 id”的完整拟提交目录上重验依赖与
+// 槽位契约，不实例化插件，也不改变当前注册表。新装与同 id 替换共用同一入口。
+func (h *Host[C]) ValidateProspective(m contract.Meta) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.validateProspectiveReplaceLocked(m.ID, contract.CloneMeta(m))
+}
+
+func (h *Host[C]) validateProspectiveReplaceLocked(id string, m contract.Meta) error {
+	prospective := make(map[string]contract.Meta, len(h.meta))
+	for existingID, existingMeta := range h.meta {
+		prospective[existingID] = existingMeta
+	}
+	prospective[id] = m
+	for existingID, existingMeta := range prospective {
+		if err := h.validateContractLocked(existingMeta, prospective); err != nil {
+			if existingID == id {
+				return err
+			}
+			return fmt.Errorf("replacement would invalidate existing plugin %s: %w", existingID, err)
+		}
+	}
+	return nil
+}
+
+// stageFunctionsLocked 预建完整函数目录增量。所有冲突/重复都在写入 h.fns
+// 前发现；replacing=true 时仅允许覆盖同 id 旧代条目。需持 h.mu。
+func (h *Host[C]) stageFunctionsLocked(id string, m contract.Meta, fp contract.FunctionProvider, g *pluginGeneration, replacing bool) (map[string]fnEntry, error) {
+	staged := map[string]fnEntry{}
+	if fp == nil {
+		return staged, nil
+	}
+	for _, f := range m.Provides.Functions {
+		key := id + "." + f.Name
+		if _, duplicate := staged[key]; duplicate {
+			return nil, fmt.Errorf("host: plugin %s: function %q conflicts", id, f.Name)
+		}
+		if existing, exists := h.fns[key]; exists && (!replacing || existing.pluginID != id) {
+			return nil, fmt.Errorf("host: plugin %s: function %q conflicts", id, f.Name)
+		}
+		staged[key] = fnEntry{pluginID: id, spec: f, provider: fp, generation: g}
+	}
+	return staged, nil
+}
+
 // registerLocked 在持锁下完成全部校验与簿记,返回 SurfaceAware 供锁外注入 Surface。
+// pending 移除和函数目录写入都发生在所有校验成功之后；staged 函数一次性提交，
+// 任何错误路径均不会留下 ghost function。
 func (h *Host[C]) registerLocked(p contract.Plugin, m contract.Meta) (contract.SurfaceAware, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.plugins[m.ID]; ok {
 		return nil, fmt.Errorf("host: plugin %s: duplicate id", m.ID)
 	}
-	// 该 id 若之前在待补载队列,进册/替换时同步移出,避免"pending + 已注册"双份。
-	h.removePendingLocked(m.ID)
-	// 替换语义下依赖校验以"自身已在册"为真:此处首注册,自身必不在册,无须排除。
 	if err := h.validateContractLocked(m); err != nil {
 		return nil, err
 	}
-	if fp, ok := p.(contract.FunctionProvider); ok {
-		for _, f := range m.Provides.Functions {
-			key := m.ID + "." + f.Name
-			if _, exists := h.fns[key]; exists {
-				return nil, fmt.Errorf("host: plugin %s: function %q conflicts", m.ID, f.Name)
-			}
-			h.fns[key] = fnEntry{pluginID: m.ID, spec: f, provider: fp}
-		}
+	g := h.newGenerationLocked(m.ID)
+	fp, _ := p.(contract.FunctionProvider)
+	staged, err := h.stageFunctionsLocked(m.ID, m, fp, g, false)
+	if err != nil {
+		return nil, err
 	}
+	// 只有全部校验与函数预检成功后才允许移出 pending。
+	h.removePendingLocked(m.ID)
 	for _, hp := range m.Provides.Hooks {
 		h.ensurePoint(contract.PointID(m.ID, hp.ID))
 	}
@@ -284,8 +395,12 @@ func (h *Host[C]) registerLocked(p contract.Plugin, m contract.Meta) (contract.S
 			h.opts.Events.EnsureTopic(contract.EventID(m.ID, ev.ID))
 		}
 	}
+	for key, entry := range staged {
+		h.fns[key] = entry
+	}
 	h.plugins[m.ID] = p
 	h.meta[m.ID] = m
+	h.generations[m.ID] = g
 	h.nextSeq++
 	h.seq[m.ID] = h.nextSeq
 	h.effects[m.ID] = &undo.Catcher{}
@@ -333,13 +448,17 @@ func (h *Host[C]) rebuildHookDeclsLocked() {
 	h.hookDecls = out
 }
 
-func (h *Host[C]) slotSatisfiedLocked(id string) bool {
+func (h *Host[C]) slotSatisfiedLocked(id string, prospective ...map[string]contract.Meta) bool {
+	registry := h.meta
+	if len(prospective) > 0 {
+		registry = prospective[0]
+	}
 	if h.opts.SlotLookup != nil {
 		if s, ok := h.opts.SlotLookup(id); ok && s.Builtin {
 			return true
 		}
 	}
-	for _, m := range h.meta {
+	for _, m := range registry {
 		if m.Slot == id {
 			return true
 		}
@@ -347,8 +466,13 @@ func (h *Host[C]) slotSatisfiedLocked(id string) bool {
 	return false
 }
 
-// slotCheck 八轴求差 + Needs（Builtin 或任一在册主张者）。
-func (h *Host[C]) slotCheck(m contract.Meta) (contract.SlotSpec, bool, []string) {
+// slotCheck 八轴求差 + Needs（Builtin 或任一在册主张者）。prospective 与
+// validateContractLocked 共用同一拟提交目录。
+func (h *Host[C]) slotCheck(m contract.Meta, prospective ...map[string]contract.Meta) (contract.SlotSpec, bool, []string) {
+	registry := h.meta
+	if len(prospective) > 0 {
+		registry = prospective[0]
+	}
 	spec, ok := contract.SlotSpec{}, false
 	if h.opts.SlotLookup != nil {
 		spec, ok = h.opts.SlotLookup(m.Slot)
@@ -415,7 +539,7 @@ func (h *Host[C]) slotCheck(m contract.Meta) (contract.SlotSpec, bool, []string)
 		}
 	}
 	for _, n := range spec.Needs {
-		if !h.slotSatisfiedLocked(n) {
+		if !h.slotSatisfiedLocked(n, registry) {
 			miss = append(miss, fmt.Sprintf("missing needed slot %q", n))
 		}
 	}
@@ -444,62 +568,79 @@ func (h *Host[C]) slotCheck(m contract.Meta) (contract.SlotSpec, bool, []string)
 	return spec, true, miss
 }
 
-// slotSatisfiedExcludingLocked 判定槽位在**排除某在册插件**后是否仍被满足
-// (内置槽位,或该插件之外的任一在册主张者)。Remove 用它精确判定:被删插件
-// 占据的槽位若仍有其它供给,槽位依赖方不算被破坏。需持 h.mu。
-func (h *Host[C]) slotSatisfiedExcludingLocked(slot, excludeID string) bool {
+// slotSatisfiedAfterRemovalLocked 判定槽位在拟删除集合之外是否仍有供给。
+func (h *Host[C]) slotSatisfiedAfterRemovalLocked(slot string, removed map[string]bool) bool {
 	if h.opts.SlotLookup != nil {
 		if s, ok := h.opts.SlotLookup(slot); ok && s.Builtin {
 			return true
 		}
 	}
 	for id, m := range h.meta {
-		if id != excludeID && m.Slot == slot {
+		if !removed[id] && m.Slot == slot {
 			return true
 		}
 	}
 	return false
 }
 
-// depBrokenByRemovalLocked 判定在册插件 m 的 DepInit 依赖是否会因删除
-// (removeID, 其占据槽位 removeSlot)而断:点名依赖直接断;点槽位依赖仅当该槽位
-// 失去 removeID 后无任何其它供给(内置/其它主张者)才算断。需持 h.mu。
-func (h *Host[C]) depBrokenByRemovalLocked(m contract.Meta, removeID, removeSlot string) bool {
+// depBrokenByRemovalSetLocked 在完整拟删除集合上判定 DepInit 是否悬空。
+// 双设依赖与注册/批量排序一致采用 Slot 优先，不能因 Plugin 指向无关 id
+// 而漏掉 Slot 边的破坏。
+func (h *Host[C]) depBrokenByRemovalSetLocked(m contract.Meta, removed map[string]bool) bool {
 	for _, r := range m.Requires.Deps {
 		if r.Kind != contract.DepInit {
 			continue
 		}
-		switch {
-		case r.Plugin != "":
-			if r.Plugin == removeID {
+		if r.Slot != "" {
+			if !h.slotSatisfiedAfterRemovalLocked(r.Slot, removed) {
 				return true
 			}
-		case r.Slot != "" && r.Slot == removeSlot:
-			if !h.slotSatisfiedExcludingLocked(r.Slot, removeID) {
-				return true
-			}
+			continue
+		}
+		if removed[r.Plugin] {
+			return true
 		}
 	}
 	return false
 }
 
+func (h *Host[C]) depBrokenByRemovalLocked(m contract.Meta, removeID string) bool {
+	return h.depBrokenByRemovalSetLocked(m, map[string]bool{removeID: true})
+}
+
 // Remove 级联卸载（cascade=false 且被依赖时 fail-closed）。
-// 只清宿主目录与 effect 栈;不调用 Disposer——若插件持有原生资源,调用方须自行
-// Close 其句柄(autoload 卸载/热替换正是如此)。
+// 只清宿主目录与 effect 栈;不调用 Disposer。旧代先禁止新调用再排空；
+// 超时/取消不提交卸载，旧目录与 effect 保留。带 ctx 的取消入口见 RemoveContext。
 func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
+	return h.RemoveContext(context.Background(), pluginID, cascade)
+}
+
+// RemoveContext 是 Remove 的可取消版本；等待上限取 Options.RemoveQuiesce。
+func (h *Host[C]) RemoveContext(ctx context.Context, pluginID string, cascade bool) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.lifecycleMu.Lock()
+	lifecycleLocked := true
+	unlockLifecycle := func() {
+		if lifecycleLocked {
+			h.lifecycleMu.Unlock()
+			lifecycleLocked = false
+		}
+	}
+	defer unlockLifecycle()
+
 	h.mu.Lock()
 	if _, ok := h.plugins[pluginID]; !ok {
 		h.mu.Unlock()
 		return nil, nil
 	}
-	targetSlot := h.meta[pluginID].Slot
+	removed := map[string]bool{pluginID: true}
+	victims := []string{pluginID}
 	if !cascade {
 		var deps []string
 		for id, m := range h.meta {
-			if id == pluginID {
-				continue
-			}
-			if h.depBrokenByRemovalLocked(m, pluginID, targetSlot) {
+			if id != pluginID && h.depBrokenByRemovalSetLocked(m, removed) {
 				deps = append(deps, id)
 			}
 		}
@@ -507,82 +648,209 @@ func (h *Host[C]) Remove(pluginID string, cascade bool) ([]string, error) {
 			h.mu.Unlock()
 			return nil, fmt.Errorf("host: remove %q refused: still required by %v (use cascade)", pluginID, deps)
 		}
-	}
-	// 逐 victim 在删除前记录版本(供 removed 事件载荷);inVictim 去重(一个依赖者
-	// 可能有多条边指向被删集合,只计一次,removed 事件也只广播一次)。删除边删边判:
-	// 槽位若仍有其它在册供给,槽位依赖方不进 victims。
-	versions := map[string]string{}
-	inVictim := map[string]bool{pluginID: true}
-	victims := []string{pluginID}
-	queue := victims
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		if m, ok := h.meta[id]; ok {
-			versions[id] = m.Version
+	} else {
+		// 在完整拟删除集合上规划 victims，不边删边改目录。任一后续静默失败
+		// 都可无残留地放弃整个事务。
+		for processed := 0; processed < len(victims); processed++ {
+			for candidateID, m := range h.meta {
+				if removed[candidateID] {
+					continue
+				}
+				if h.depBrokenByRemovalSetLocked(m, removed) {
+					removed[candidateID] = true
+					victims = append(victims, candidateID)
+				}
+			}
 		}
-		idSlot := h.meta[id].Slot
+	}
+	versions := map[string]string{}
+	type removalRow struct {
+		id     string
+		p      contract.Plugin
+		g      *pluginGeneration
+		effect *undo.Catcher
+	}
+	rows := make([]removalRow, 0, len(victims))
+	for _, id := range victims {
+		versions[id] = h.meta[id].Version
+		g := h.generations[id]
+		h.sealGenerationLocked(g)
+		rows = append(rows, removalRow{id: id, p: h.plugins[id], g: g, effect: h.effects[id]})
+	}
+	h.mu.Unlock()
+
+	// 同一父 deadline 覆盖整个级联排空过程，避免 victims 数量放大等待上限。
+	qctx := ctx
+	cancel := func() {}
+	if wait := h.opts.RemoveQuiesce; wait > 0 {
+		qctx, cancel = context.WithTimeout(ctx, wait)
+	}
+	defer cancel()
+	for _, row := range rows {
+		if err := h.awaitGenerationQuiesce(qctx, row.id, row.g, row.p, h.opts.RemoveQuiesce); err != nil {
+			h.mu.Lock()
+			for _, pending := range rows {
+				h.resumeGenerationLocked(pending.g)
+			}
+			h.mu.Unlock()
+			return nil, fmt.Errorf("host: remove %q: %w", pluginID, err)
+		}
+	}
+
+	// 所有旧代已排空后才原子删除目录；effect 一律锁外清退，允许撤销函数
+	// 回查 Host 而不会与 h.mu 自死锁。
+	h.mu.Lock()
+	var effects []*undo.Catcher
+	for _, row := range rows {
+		id := row.id
 		delete(h.plugins, id)
 		delete(h.meta, id)
 		delete(h.seq, id)
+		delete(h.generations, id)
 		for k := range h.fns {
 			if h.fns[k].pluginID == id {
 				delete(h.fns, k)
 			}
 		}
 		delete(h.applied, id)
-		if c := h.effects[id]; c != nil {
-			c.Close()
-			delete(h.effects, id)
+		if row.effect != nil {
+			effects = append(effects, row.effect)
 		}
-		for id2, m := range h.meta {
-			if inVictim[id2] {
-				continue
-			}
-			if h.depBrokenByRemovalLocked(m, id, idSlot) {
-				inVictim[id2] = true
-				victims = append(victims, id2)
-				queue = append(queue, id2)
-			}
+		delete(h.effects, id)
+	}
+	h.rebuildHookDeclsLocked()
+	h.mu.Unlock()
+	unlockLifecycle()
+	for _, effect := range effects {
+		if err := effect.Close(); err != nil {
+			h.logf("host: remove effect cleanup: %v", err)
 		}
 	}
-	h.rebuildHookDeclsLocked() // 声明者可能被删:全量重建
-	h.mu.Unlock()
 
 	h.logf("host: plugin %s removed (victims=%v)", pluginID, victims)
-	// 生命周期事件须在锁外广播:订阅回调可能回查宿主,持锁会死锁。
 	for _, v := range victims {
 		h.emitLifecycle(contract.EventPluginRemoved, v, versions[v])
 	}
 	return victims, nil
 }
 
-// Replace 热替换同 id 插件。契约校验与 Register 同款(DepInit 依赖/槽位八轴)——
-// 替换口不得比注册口宽松,坏包 fail-closed 拒换、旧版继续服务。
-// 只置换目录并清退旧实现的 effect 栈;旧实现若是 Disposer,调用方须自行 Close
-// 旧句柄(autoload 热替换正是如此:Replace 后立即 old.Close)。
+// Replace 热替换同 id 插件。流程为 prospective 校验→prepare(能力面/配置回灌)
+// →封闭旧代准入→排空→原子 commit→清退旧 effect。任一步失败均不广播
+// plugin.replaced，旧实例/旧目录/旧 effect 保持服务。可取消入口见 ReplaceContext。
 func (h *Host[C]) Replace(p contract.Plugin) error {
-	m := contract.CloneMeta(p.Meta()) // 同 Register:替换件入册即快照
+	return h.ReplaceContext(context.Background(), p)
+}
+
+// ReplaceContext 是 Replace 的可取消版本；静默等待上限取 Options.ReplaceQuiesce。
+func (h *Host[C]) ReplaceContext(ctx context.Context, p contract.Plugin) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m := contract.CloneMeta(p.Meta()) // 外部 Meta 在 lifecycleMu/h.mu 之外执行
 	id := m.ID
-	var surfaceAware contract.SurfaceAware
+	lifecycleLocked := false
+	unlockLifecycle := func() {
+		if lifecycleLocked {
+			h.lifecycleMu.Unlock()
+			lifecycleLocked = false
+		}
+	}
+	defer unlockLifecycle()
+
 	h.mu.Lock()
-	if _, ok := h.plugins[id]; !ok {
+	old, ok := h.plugins[id]
+	if !ok {
 		h.mu.Unlock()
 		return fmt.Errorf("host: replace: %q not registered", id)
 	}
-	if err := h.validateContractLocked(m); err != nil {
+	if err := h.validateProspectiveReplaceLocked(id, m); err != nil {
 		h.mu.Unlock()
 		return fmt.Errorf("host: replace: %w", err)
 	}
-	for k := range h.fns {
-		if h.fns[k].pluginID == id {
-			delete(h.fns, k)
+	oldGeneration := h.generations[id]
+	oldEffects := h.effects[id]
+	appliedCfg, hasApplied := h.applied[id]
+	appliedCfg = append(json.RawMessage(nil), appliedCfg...)
+	newGeneration := h.newGenerationLocked(id)
+	fp, _ := p.(contract.FunctionProvider)
+	staged, err := h.stageFunctionsLocked(id, m, fp, newGeneration, true)
+	if err != nil {
+		h.mu.Unlock()
+		return fmt.Errorf("host: replace: %w", err)
+	}
+	h.mu.Unlock()
+
+	// 配置先在旧目录仍有效时完成 Schema 重验与 prepare；失败不触碰旧 effect。
+	var configurable contract.Configurable
+	if hasApplied {
+		var ok bool
+		configurable, ok = p.(contract.Configurable)
+		if !ok {
+			return fmt.Errorf("host: replace: plugin %s: existing config cannot be replayed: new instance is not configurable", id)
+		}
+		if err := validateConfigForMeta(id, m, appliedCfg); err != nil {
+			return fmt.Errorf("host: replace: config replay: %w", err)
 		}
 	}
-	h.plugins[id] = p
-	h.meta[id] = m
-	appliedCfg, hasApplied := h.applied[id] // 持锁顺带取(applied 由 h.mu 保护)
-	// 替换件的新声明面(点位/主题)与首注册一致地补落。
+	newEffects := &undo.Catcher{}
+	closePrepared := func() {
+		unlockLifecycle()
+		if err := newEffects.Close(); err != nil {
+			h.logf("host: plugin %s prepared effect cleanup: %v", id, err)
+		}
+	}
+	if surfaceAware, ok := p.(contract.SurfaceAware); ok {
+		h.injectSurface(surfaceAware, id, h.surfaceFor(m, newEffects))
+	}
+	if hasApplied {
+		// 不取 cfgMu：Replace 可能由 SetConfig→ApplyConfig→Replace 自替换链进入。
+		// Schema 已按新 Meta 重验；ApplyConfig panic 统一归一为错误。
+		var reapplied error
+		func() {
+			defer fromPanic(&reapplied, fmt.Sprintf("plugin %s re-apply config", id))
+			reapplied = configurable.ApplyConfig(appliedCfg)
+		}()
+		if reapplied != nil {
+			closePrepared()
+			return fmt.Errorf("host: replace: plugin %s config re-apply failed: %w", id, reapplied)
+		}
+	}
+
+	// prepare 不持 lifecycleMu，SetSurface/ApplyConfig 可安全回查宿主。进入
+	// seal→drain→commit 串行区后重新校验 prospective registry 与函数冲突，
+	// 防止 prepare 期间其它插件的注册/替换使先前判断过期。
+	h.lifecycleMu.Lock()
+	lifecycleLocked = true
+	h.mu.Lock()
+	if h.generations[id] != oldGeneration || h.plugins[id] != old {
+		h.mu.Unlock()
+		closePrepared()
+		return fmt.Errorf("host: replace: plugin %s changed during prepare", id)
+	}
+	if err := h.validateProspectiveReplaceLocked(id, m); err != nil {
+		h.mu.Unlock()
+		closePrepared()
+		return fmt.Errorf("host: replace: registry changed during prepare: %w", err)
+	}
+	staged, err = h.stageFunctionsLocked(id, m, fp, newGeneration, true)
+	if err != nil {
+		h.mu.Unlock()
+		closePrepared()
+		return fmt.Errorf("host: replace: %w", err)
+	}
+	h.sealGenerationLocked(oldGeneration)
+	h.mu.Unlock()
+	if err := h.awaitGenerationQuiesce(ctx, id, oldGeneration, old, h.opts.ReplaceQuiesce); err != nil {
+		h.mu.Lock()
+		h.resumeGenerationLocked(oldGeneration)
+		h.mu.Unlock()
+		closePrepared()
+		return fmt.Errorf("host: replace: %w", err)
+	}
+
+	// 只有旧代真正排空后才提交函数/实例/Meta/effect 目录。声明点位也在
+	// commit 才补落，失败路径不会留下新声明面。
+	h.mu.Lock()
 	for _, hp := range m.Provides.Hooks {
 		h.ensurePoint(contract.PointID(id, hp.ID))
 	}
@@ -597,43 +865,28 @@ func (h *Host[C]) Replace(p contract.Plugin) error {
 			h.opts.Events.EnsureTopic(contract.EventID(id, ev.ID))
 		}
 	}
-	if fp, ok := p.(contract.FunctionProvider); ok {
-		for _, f := range m.Provides.Functions {
-			h.fns[id+"."+f.Name] = fnEntry{pluginID: id, spec: f, provider: fp}
+	for k := range h.fns {
+		if h.fns[k].pluginID == id {
+			delete(h.fns, k)
 		}
 	}
-	if ea, ok := p.(contract.SurfaceAware); ok {
-		surfaceAware = ea
+	for key, entry := range staged {
+		h.fns[key] = entry
 	}
-	oldEffects := h.effects[id]
-	h.effects[id] = &undo.Catcher{}
-	newEff := h.effects[id]
-	h.rebuildHookDeclsLocked() // 新版本可能增删自有 hook 点:全量重建
+	h.plugins[id] = p
+	h.meta[id] = m
+	h.generations[id] = newGeneration
+	h.effects[id] = newEffects
+	h.rebuildHookDeclsLocked()
 	h.mu.Unlock()
-	// 旧实现的 effect 撤销栈清退(订阅/hook 回调一并回滚)。
+	unlockLifecycle()
+
+	// 提交成功后旧 effect 才锁外清退。新实例 prepare 可能已产生外部副作用；
+	// effect 只能撤销经 Surface 登记的订阅/hook 等，宿主不声称能回滚网络、
+	// 文件或其它外部副作用。调用方仍负责旧 Disposer（autoload 在成功后 Close）。
 	if oldEffects != nil {
-		oldEffects.Close()
-	}
-	// 同 Register:SetSurface 在锁外,插件可在其中回查宿主而不死锁。
-	if surfaceAware != nil {
-		h.injectSurface(surfaceAware, id, h.surfaceFor(m, newEff))
-	}
-	// 替换件配置回灌:applied 缓存是宿主侧状态,新实例必须继承——否则热更
-	// 静默丢已配置行为(如审批开关回落默认关=fail-open)。与装配序一致:
-	// 先 SetSurface 再 ApplyConfig;「替换口不得比注册口宽松」同源精神。
-	// 直接 ApplyConfig 而非 SetConfig:本方法可能在 SetConfig→ApplyConfig→
-	// Replace(自我替换)链上被调,再取 cfgMu 即自死锁;schema 已在原 SetConfig
-	// 校验过、applied 缓存无需重写,panic 经 fromPanic 归一(机制层故障隔离)。
-	if hasApplied {
-		if c, ok := p.(contract.Configurable); ok {
-			var reapplied error
-			func() {
-				defer fromPanic(&reapplied, fmt.Sprintf("plugin %s re-apply config", id))
-				reapplied = c.ApplyConfig(appliedCfg)
-			}()
-			if reapplied != nil {
-				h.logf("host: plugin %s replaced but config re-apply failed: %v", id, reapplied)
-			}
+		if err := oldEffects.Close(); err != nil {
+			h.logf("host: plugin %s old effect cleanup: %v", id, err)
 		}
 	}
 	h.logf("host: plugin %s replaced (v%s)", id, m.Version)

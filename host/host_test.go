@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -132,7 +133,7 @@ func TestHostConfigValidationAndRemoveCascade(t *testing.T) {
 	if err := h.Register(p); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.SetConfig("cfg.p", json.RawMessage(`{"level":"high"}`)); err == nil || !strings.Contains(err.Error(), "level: expected integer") {
+	if err := h.SetConfig("cfg.p", json.RawMessage(`{"level":"high"}`)); err == nil || !strings.Contains(err.Error(), "/level") || !strings.Contains(err.Error(), "want integer") {
 		t.Fatalf("bad config err = %v", err)
 	}
 	if err := h.SetConfig("cfg.p", json.RawMessage(`{"level":3}`)); err != nil {
@@ -615,6 +616,40 @@ func TestDependencyMinVersionEnforced(t *testing.T) {
 	}
 }
 
+func TestDependencyVersionConstraintsRejectMalformedSegments(t *testing.T) {
+	if !versionAtLeast("2.0.0", "1.0.0") {
+		t.Fatal("2.0.0 must satisfy min_version 1.0.0")
+	}
+	for _, invalid := range []string{"1.x.0", "1..0", "1.-1", "1.0.0-beta"} {
+		if versionAtLeast("2.0.0", invalid) {
+			t.Fatalf("malformed constraint %q must not compare as zero-valued segments", invalid)
+		}
+	}
+
+	h := New[any](Options[any]{})
+	if err := h.Register(&demoPlugin{meta: contract.Meta{ID: "dep.base", Name: "B", Version: "2.0.0"}}); err != nil {
+		t.Fatal(err)
+	}
+	for n, invalid := range []string{"1.x.0", "1..0", "1.-1", "1.0.0-beta"} {
+		needs := &demoPlugin{meta: contract.Meta{ID: "dep.invalid." + strconv.Itoa(n), Name: "N", Version: "1",
+			Requires: contract.Requires{Deps: []contract.Dependency{{Plugin: "dep.base", Kind: contract.DepInit, MinVersion: invalid}}}}}
+		if err := h.Register(needs); err == nil || !strings.Contains(err.Error(), "invalid min_version") {
+			t.Fatalf("min_version %q registration error = %v", invalid, err)
+		}
+	}
+	valid := &demoPlugin{meta: contract.Meta{ID: "dep.valid", Name: "N", Version: "1",
+		Requires: contract.Requires{Deps: []contract.Dependency{{Plugin: "dep.base", Kind: contract.DepInit, MinVersion: "1.0.0"}}}}}
+	if err := h.Register(valid); err != nil {
+		t.Fatalf("2.0.0 dependency should satisfy 1.0.0: %v", err)
+	}
+
+	lazy := &demoPlugin{meta: contract.Meta{ID: "dep.lazy", Name: "N", Version: "1",
+		Requires: contract.Requires{Deps: []contract.Dependency{{Plugin: "dep.missing", Kind: contract.DepInit, MinVersion: "1.bad"}}}}}
+	if status, err := h.RegisterLazy(lazy); err == nil || status != StatusRegistered {
+		t.Fatalf("lazy registration with malformed constraint = %v, %v; want immediate rejection", status, err)
+	}
+}
+
 func TestPublishEventCarriesSource(t *testing.T) {
 	// 事件应携带发布方插件 id(Event.Source);宿主级事件 source 为空。
 	h := New[any](Options[any]{})
@@ -895,5 +930,43 @@ func TestNetSchemeGuard(t *testing.T) {
 		if _, err := net.DialStream(ctx, u, nil); err == nil {
 			t.Fatalf("DialStream(%q) should be rejected", u)
 		}
+	}
+}
+
+// 宿主 Surface.Exec/Op 必须把调用方插件 id 放进 ctx(插件私有 bin 解析依赖)。
+func TestSurfaceInjectsCallerID(t *testing.T) {
+	var execID, opID string
+	h := New[struct{}](Options[struct{}]{
+		ExecFn: func(ctx context.Context, cmd string) (string, error) {
+			execID = contract.PluginIDFromContext(ctx)
+			return "", nil
+		},
+		Ops: map[string]Op{
+			contract.CapExec: func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+				opID = contract.PluginIDFromContext(ctx)
+				return json.RawMessage(`{}`), nil
+			},
+		},
+		OpAliases: map[string]string{"demo.op": contract.CapExec},
+	})
+	p := &demoPlugin{meta: contract.Meta{
+		ID: "demo.p", Name: "D", Version: "1",
+		Provides: contract.Provides{Capabilities: []string{contract.CapExec}},
+	}}
+	if err := h.Register(p); err != nil {
+		t.Fatal(err)
+	}
+	s, ok := h.SurfaceFor("demo.p")
+	if !ok {
+		t.Fatal("surface missing")
+	}
+	if _, err := s.Exec(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Op(context.Background(), "demo.op", nil); err != nil {
+		t.Fatal(err)
+	}
+	if execID != "demo.p" || opID != "demo.p" {
+		t.Fatalf("caller id = exec:%q op:%q", execID, opID)
 	}
 }
