@@ -8,10 +8,11 @@
 跨边界（WASM ABI 与远程通道帧）的结果统一为：
 
 ```json
-{"ok": bool, "result": any, "result_b64": string, "error": string}
+{"ok": bool, "result": any, "result_b64": string, "error": string, "error_detail": object}
 ```
 
-- `ok=false` 时 `error` 为人类可读消息；
+- `ok=false` 时 `error` 为人类可读消息；可选 `error_detail` 携带 `code/phase/plugin/fn/path/retryable/message`，
+  旧消费者可继续只读 `error`；
 - 二进制值（文件 / KV 等）走 `result_b64`（base64）；
 - `result` 为 JSON 载荷（函数返回值、配置等）。
 
@@ -235,6 +236,10 @@ egop 不实现任何平台 IO）。读写按声明**分向门控**（宿主 `fsG
 0=未知；旧 guest 忽略新字段,ABI JSON 增量安全）。跨世界同构：wasm ABI
 `fs_read`/`fs_readdir`/`fs_write` 与远程通道 `OpFSRead`/`OpFSReadDir`/`OpFSWrite`
 走同一门控视图。
+
+`FSEx` 是可选扩展：`Stat`/`ReadRange`/`Append` 支持大文件范围读与追加，避免整文件跨 ABI；
+宿主 `fsGuard` 对扩展方法仍执行同一读写分向门控，底层未实现扩展时明确返回不支持，不静默
+退回整文件操作。路径范围与沙箱仍由注入实现决定。
 
 **fs_read 尺寸护栏**：wasm ABI 的 `fs_read` 单次回传上限 `wasm.MaxFSReadBytes`
 （8MiB）——base64 信封放大 4/3 灌进 guest 线性内存（上限 64MiB）前在宿主侧拒读

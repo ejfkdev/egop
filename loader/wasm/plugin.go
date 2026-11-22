@@ -25,6 +25,10 @@ type Plugin struct {
 	insts    []*inst
 	byName   map[string]*inst // wazero module 名 → inst(宿主注入函数经 m 认回)
 	poolMu   sync.Mutex       // 保护 insts/byName/compiled/lastCfg(生命周期读写收口)
+	// waitMu/waiters:acquire 的 FIFO 公平队列(2026-10-15;锁序恒 waitMu→
+	// poolMu)。等待者持缓冲 1 的 chan,release 以所有权交接递实例(锁不放开)。
+	waitMu  sync.Mutex
+	waiters []chan *inst
 	// surface 经原子指针:宿主注入函数(热路径)无锁读,SetSurface 单写。
 	// 注册时序保证单写;读侧 surf() 无锁。
 	surfacePtr atomic.Pointer[contract.Surface]
@@ -32,11 +36,24 @@ type Plugin struct {
 	logFn      func(level, msg string)
 	closed     atomic.Bool // 显式 Close():revive 不适用(注销/关停是终态)
 
+	// memPages 本插件生效的线性内存上限(页;memory_pages import 供 guest 自适应
+	// 软堆顶)。实例化前由 memoryPages() 解析并写入。
+	memPages uint32
 	// revive 三件套:guest 代码字节 + 装载选项 + 最近生效配置——意外打断(ctx 取消
 	// 看门狗/trap)后按需重建实例并回放 init/config(插件内存态归零=热重启一次)。
 	wasmRaw  []byte
 	loadOpts Options
 	lastCfg  json.RawMessage
+
+	// toolCache 活体工具面快照(ToolSpecs 非阻塞化,2026-10-31):元数据查询是
+	// 装配热路径(每次 agent 启动全量枚举宿主工具),不得排在长调用(LLM 流式
+	// 轮次/整轮 react)后面等实例——否则每个忙插件烧满查询超时,启动被拖到
+	// 10s×N。口径:新鲜快照直接返回;否则仅在**无等待者且有空闲实例**时做
+	// 活体查询,忙则回旧快照(再退清单静态表),动态发现(MCP)的新鲜度由 TTL
+	// 保证,不牺牲启动延迟。
+	toolMu      sync.Mutex
+	toolCache   []contract.FuncSpec
+	toolCacheAt time.Time
 }
 
 func newPlugin(name string) *Plugin {
@@ -140,30 +157,73 @@ func (p *Plugin) CallFunc(ctx context.Context, fname string, input json.RawMessa
 // 在此设上限防 guest 挂起拖死收集方)。
 const toolSpecsTimeout = 10 * time.Second
 
-// ToolSpecs 实现 base.ToolProvider:**活体查询优先**(guest 导出
-// egop_tool_specs 时——动态工具插件如 MCP 的运行期发现真源),无导出/失败/
-// 实例已 broken 回落线上清单静态表(向后兼容旧 guest)。
+// toolSpecsTTL 活体工具面快照复用窗口:动态发现插件(MCP)的工具集变化以
+// 秒级延迟可见,换取装配热路径(每次 agent 启动)永不排队等实例。
+const toolSpecsTTL = 5 * time.Second
+
+// ToolSpecs 实现 base.ToolProvider:**快照优先,空/过期且实例空闲时活体刷新**。
+// 活体查询(guest 导出 egop_tool_specs)是动态工具插件如 MCP 的运行期发现真源,
+// 但实例被长调用(LLM 流式轮次/整轮 react)占用时,排队查询会烧满超时并拖死
+// 调用方(实测:每次 agent 启动被两个忙插件各拖 10s)。改为非阻塞:忙=回旧快照,
+// 无快照=回线上清单静态表;绝不为元数据排队,也不插真实工作的队。
 func (p *Plugin) ToolSpecs() []contract.FuncSpec {
-	ctx, cancel := context.WithTimeout(context.Background(), toolSpecsTimeout)
-	defer cancel()
-	if i, err := p.acquire(ctx); err == nil {
-		ctx = withHeld(ctx, p) // 同 CallFunc:嵌套重入标记
-		live := false
-		var out json.RawMessage
-		if i.mod != nil && !i.broken.Load() { // 注册期 mod 未挂:回落清单(装配序守卫)
+	if specs, fresh := p.cachedToolSpecs(); fresh {
+		return specs
+	}
+	// 仅在无等待者且有空闲实例时活体查询(tryAcquire 不入队)。
+	if i, err := p.tryAcquire(); err == nil {
+		ctx, cancel := context.WithTimeout(withHeld(context.Background(), p), toolSpecsTimeout)
+		out, live := json.RawMessage(nil), false
+		if i.mod != nil && !i.broken.Load() { // 注册期 mod 未挂:回落快照/清单(装配序守卫)
 			if o, err := i.callExport(p, ctx, ExportToolSpecs); err == nil {
 				out, live = o, true
 			}
 		}
+		cancel()
 		p.release(i)
 		if live {
 			var specs []contract.FuncSpec
 			if json.Unmarshal(out, &specs) == nil {
+				p.storeToolSpecs(specs)
 				return specs
 			}
 		}
 	}
+	return p.staleToolSpecs()
+}
+
+// cachedToolSpecs 新鲜快照(TTL 内)。
+func (p *Plugin) cachedToolSpecs() ([]contract.FuncSpec, bool) {
+	p.toolMu.Lock()
+	defer p.toolMu.Unlock()
+	if p.toolCache == nil || time.Since(p.toolCacheAt) > toolSpecsTTL {
+		return nil, false
+	}
+	return append([]contract.FuncSpec(nil), p.toolCache...), true
+}
+
+// staleToolSpecs 过期快照优先(动态面已知集合优于静态清单),无快照退清单。
+func (p *Plugin) staleToolSpecs() []contract.FuncSpec {
+	p.toolMu.Lock()
+	defer p.toolMu.Unlock()
+	if p.toolCache != nil {
+		return append([]contract.FuncSpec(nil), p.toolCache...)
+	}
 	return p.manifest.Tools
+}
+
+func (p *Plugin) storeToolSpecs(specs []contract.FuncSpec) {
+	p.toolMu.Lock()
+	p.toolCache, p.toolCacheAt = specs, time.Now()
+	p.toolMu.Unlock()
+}
+
+// invalidateToolSpecs 配置变更后强制下次调用重新活体查询(动态工具面可能随
+// 连接/发现变化;新的发现窗口 = TTL,不阻塞启动)。
+func (p *Plugin) invalidateToolSpecs() {
+	p.toolMu.Lock()
+	p.toolCacheAt = time.Time{}
+	p.toolMu.Unlock()
 }
 
 // ToolRaw 按名返回**无类型工具执行**闭包:tctx 即线上 JSON(ABI 同形;
@@ -244,6 +304,7 @@ func (p *Plugin) ApplyConfig(cfg json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	p.invalidateToolSpecs() // 动态工具面可能随配置变化,下次查询重发现
 	p.poolMu.Lock()
 	p.lastCfg = append(json.RawMessage(nil), cfg...) // revive 回放锚
 	p.poolMu.Unlock()
@@ -271,20 +332,50 @@ func (p *Plugin) SetSurface(s contract.Surface) {
 // Close 关闭全池:撤销订阅、尽力执行 egop_shutdown、关模块与运行时。
 // 显式关闭是终态:之后的调用不再 revive(与意外打断的可恢复语义区分)。
 func (p *Plugin) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.closed.Store(true)
+	p.wakeAllWaiters() // 排队者收 nil=关闭错误,绝不陪葬挂死
 	var errs []error
 	p.poolMu.Lock()
 	insts := append([]*inst(nil), p.insts...)
 	p.insts = nil
 	p.byName = map[string]*inst{}
 	p.poolMu.Unlock()
+
+	// 标记实际持锁者的兜底收尾责任。正常路径拿到锁后清除标记;若调用方
+	// deadline 先于非协作 host 回调返回,release 会清理,无需另起锁等待 goroutine。
 	for _, i := range insts {
-		i.mu.Lock()
+		i.closeOnRelease.Store(true)
+	}
+	forced := false
+	for _, i := range insts {
+		if !i.mu.TryLock() {
+			forced = true
+			break
+		}
+		i.mu.Unlock()
+	}
+	// 不得在 inst.mu 上先等:纯计算 guest 可能永不返回。关 runtime 会先打断
+	// 活跃模块(WithCloseOnContextDone),再进入下面的常规资源清退。
+	if forced && p.runtime != nil {
+		if err := p.runtime.CloseWithExitCode(ctx, 255); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, i := range insts {
+		if err := lockInstanceForClose(ctx, i); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		i.closeOnRelease.Store(false)
+		_ = i.endKVUpdate()
 		if err := i.unsubs.Close(); err != nil {
 			errs = append(errs, err)
 		}
 		if i.mod != nil {
-			if i.mod.ExportedFunction(ExportShutdown) != nil {
+			if !forced && i.mod.ExportedFunction(ExportShutdown) != nil {
 				// 优雅关停设兜底超时(调用方 ctx 常为 Background);超时经看门狗打断后仍续关 module/runtime。
 				sctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 				if _, err := i.callExport(p, sctx, ExportShutdown); err != nil {
@@ -315,6 +406,45 @@ func (p *Plugin) Close(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// lockInstanceForClose 用 TryLock 观察 ctx,不为可能永不释放的 sync.Mutex
+// 留下一个锁等待 goroutine。空闲快路径无定时器开销。
+func lockInstanceForClose(ctx context.Context, i *inst) error {
+	if i.mu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if i.mu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+// Busy 实现 host.Quiescer 可选探测：TryLock 检查
+// 全池——任一实例被占=在飞调用存在。只探测不等待不阻塞在飞调用;
+// 宿主热更收尾据此决定等待或放弃(host/quiesce.go)。
+func (p *Plugin) Busy() (bool, error) {
+	if p.closed.Load() {
+		return false, nil // 已关=静默
+	}
+	p.poolMu.Lock()
+	insts := append([]*inst(nil), p.insts...)
+	p.poolMu.Unlock()
+	for _, i := range insts {
+		if !i.mu.TryLock() {
+			return true, nil
+		}
+		i.mu.Unlock()
+	}
+	return false, nil
 }
 
 // callMeta 无信封特殊通道:仅 egop_meta 用(裸 manifest JSON;装载期单实例上下文)。

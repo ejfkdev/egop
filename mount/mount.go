@@ -211,6 +211,48 @@ func (rt *Runtime) Events() <-chan autoload.Event {
 	return rt.watcher.Events()
 }
 
+// Poll 用本次装配的目录观察器显式驱动一轮热更。未开 Watch 时也可用于
+// 上传/控制面后的手动同步;事件语义与后台轮询完全一致。
+func (rt *Runtime) Poll(ctx context.Context) []autoload.Event {
+	if rt == nil || rt.watcher == nil {
+		return nil
+	}
+	return rt.watcher.Poll(ctx)
+}
+
+// PollStable 在同一观察器互斥区内完成两轮确认;未开 Watch 时同样可显式调用。
+func (rt *Runtime) PollStable(ctx context.Context) []autoload.Event {
+	if rt == nil || rt.watcher == nil {
+		return nil
+	}
+	return rt.watcher.PollStable(ctx)
+}
+
+// ArtifactState 返回 watcher 已应用的工件路径与内容 hash，供管理操作做结果对账。
+func (rt *Runtime) ArtifactState(pluginID string) (string, string, bool) {
+	if rt == nil || rt.watcher == nil {
+		return "", "", false
+	}
+	return rt.watcher.ArtifactState(pluginID)
+}
+
+// ArtifactPath 返回目录装载插件当前生效的工件路径，供持久管理做来源归属校验。
+func (rt *Runtime) ArtifactPath(pluginID string) (string, bool) {
+	if rt == nil || rt.watcher == nil {
+		return "", false
+	}
+	return rt.watcher.PathFor(pluginID)
+}
+
+// Reload 用本次装配已有的目录观察器强制重建一个插件。手动重载与后台 Watch
+// 共用读取、两段确认、替换失败回滚及配置回放语义;非目录装载插件如实报错。
+func (rt *Runtime) Reload(ctx context.Context, pluginID string) ([]autoload.Event, error) {
+	if rt == nil || rt.watcher == nil {
+		return nil, fmt.Errorf("mount: plugin %q has no directory watcher", pluginID)
+	}
+	return rt.watcher.Reload(ctx, pluginID)
+}
+
 // Close 统一清退:停热更、停入站 accept(并关闭已接受的入站流,传导对端 EOF)、
 // 断出站会话(OnClosed 触发宿主卸载)。幂等。
 // 装配失败路径(failed)额外做全清:目录阶段已进册的插件反注册并关闭句柄

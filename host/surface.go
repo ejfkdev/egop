@@ -201,7 +201,8 @@ func (e *plugSurface[C]) Exec(ctx context.Context, cmd string) (string, error) {
 	if !e.caps[contract.CapExec] || e.h.opts.ExecFn == nil {
 		return "", fmt.Errorf("plugin %s: capability %q not declared", e.meta.ID, contract.CapExec)
 	}
-	return e.h.opts.ExecFn(ctx, cmd)
+	// 调用方身份随 ctx 下传:装配层据此解析插件私有 bin/PATH(接口不变)。
+	return e.h.opts.ExecFn(contract.WithPluginID(ctx, e.meta.ID), cmd)
 }
 func (e *plugSurface[C]) Op(ctx context.Context, name string, input json.RawMessage) (json.RawMessage, error) {
 	capName := e.h.opts.opCap(name)
@@ -212,7 +213,7 @@ func (e *plugSurface[C]) Op(ctx context.Context, name string, input json.RawMess
 	if !ok {
 		return nil, fmt.Errorf("plugin %s: capability %q not available", e.meta.ID, name)
 	}
-	return fn(ctx, input)
+	return fn(contract.WithPluginID(ctx, e.meta.ID), input)
 }
 
 // GetConfig 读其它插件声明的配置字段:先 config.read 能力门控,再字段级 Readable。

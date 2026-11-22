@@ -8,8 +8,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ejfkdev/egop/contract"
 )
@@ -76,6 +80,57 @@ func TestReviveToolFace(t *testing.T) {
 	if err != nil || s != "42" {
 		t.Fatalf("revived tool = %q, %v", s, err)
 	}
+}
+
+func TestReviveInstantiationHonorsCallerDeadline(t *testing.T) {
+	p := mustLoad(t)
+	looping, err := os.ReadFile(filepath.Join("testdata", "startloop.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := p.runtime.CompileModule(context.Background(), looping)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	i := p.insts[0]
+	i.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			i.mu.Unlock()
+		}
+		_ = p.Close(context.Background())
+	}()
+	oldCompiled := p.compiledModule()
+	p.poolMu.Lock()
+	p.compiled = compiled
+	p.poolMu.Unlock()
+	defer oldCompiled.Close(context.Background())
+	i.broken.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- p.reviveLocked(ctx, i) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("revive error = %v, want caller deadline", err)
+		}
+		if !i.broken.Load() {
+			t.Fatal("failed revive must leave the instance broken")
+		}
+	case <-time.After(time.Second):
+		_ = p.runtime.CloseWithExitCode(context.Background(), 255)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("revive ignored its caller deadline while _start was looping")
+	}
+	i.mu.Unlock()
+	locked = false
 }
 
 // TestReviveNoHookAccumulation revive 重放 init 不累积 hook 注册:撤销随主实例

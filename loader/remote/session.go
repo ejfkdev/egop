@@ -230,7 +230,7 @@ func (s *Session) requestPayload(ctx context.Context, f *Frame) (json.RawMessage
 	if err != nil {
 		return nil, err
 	}
-	if rep.Error != "" {
+	if rep.Error != "" && len(rep.Payload) == 0 {
 		return nil, errors.New(rep.Error)
 	}
 	return decodeEnvelope(rep.Payload)

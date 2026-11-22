@@ -54,6 +54,13 @@ type Options[C any] struct {
 	DisableFuncValidation bool
 	// Logf 生命周期日志口(注册/替换/卸载/配置等;nil = 静默)。
 	Logf func(format string, args ...any)
+	// ReplaceQuiesce 是 Replace 封闭旧代准入后等待在飞调用与可选 Quiescer
+	// 静默的上限。<=0 表示不等待：仅当旧代已无在飞调用且探测静默时提交，
+	// 否则返回 ErrQuiesceTimeout 并保留旧实例/目录/effect。
+	ReplaceQuiesce time.Duration
+	// RemoveQuiesce 是 Remove/RemoveContext 的同类静默等待上限。超时或
+	// 调用方 ctx 取消时不提交卸载，已封闭但尚未提交的代会恢复准入。
+	RemoveQuiesce time.Duration
 }
 
 // OpAlias 查 wire 短名的守卫能力词(未声明别名时短名即能力词)。
@@ -84,6 +91,13 @@ type Host[C any] struct {
 	nextSeq uint64
 	effects map[string]*undo.Catcher // 每个插件注册的 effect 撤销栈(Remove/Replace 自动回滚)
 
+	// lifecycleMu 串行 Replace/Remove 的 seal→drain→commit 事务；Replace 的
+	// prepare 与 effect 清退不持它，允许插件回调重入宿主生命周期面。
+	// h.mu 只保护目录与代际计数，绝不覆盖插件调用或 effect 清退。
+	lifecycleMu    sync.Mutex
+	generations    map[string]*pluginGeneration
+	nextGeneration uint64
+
 	// cfgMu 串行化配置写链路(SetConfig/SetConfigField 的读改写全程):并发下发
 	// 不交错、单字段合并不丢更新。配置写是控制面低频操作,串行代价可忽略;
 	// 与 mu 分离,ApplyConfig(插件代码)执行期间不占用宿主目录锁。
@@ -91,6 +105,7 @@ type Host[C any] struct {
 
 	pending        []string                   // 懒加载待补载 id(保持插入序)
 	pendingPlugins map[string]contract.Plugin // id → 待补载插件
+	pendingMeta    map[string]contract.Meta   // id → RegisterLazy 时的深拷贝 Meta
 	netSchemes     map[string]bool            // 出站网络允许的协议 scheme(小写)
 
 	// hookDecls 是声明面自有 hook 点的登记(hook id → 声明者+Kind)。
@@ -106,9 +121,10 @@ type hookDecl struct {
 }
 
 type fnEntry struct {
-	pluginID string
-	spec     contract.FuncSpec
-	provider contract.FunctionProvider
+	pluginID   string
+	spec       contract.FuncSpec
+	provider   contract.FunctionProvider
+	generation *pluginGeneration
 }
 
 // New 构造宿主。开箱默认(opts 零值也可用):Events=内存总线 MemEvents、
@@ -140,7 +156,9 @@ func New[C any](opts Options[C]) *Host[C] {
 		applied:        map[string]json.RawMessage{},
 		seq:            map[string]uint64{},
 		effects:        map[string]*undo.Catcher{},
+		generations:    map[string]*pluginGeneration{},
 		pendingPlugins: map[string]contract.Plugin{},
+		pendingMeta:    map[string]contract.Meta{},
 		netSchemes:     buildNetSchemes(opts.NetSchemes),
 		hookDecls:      map[string]hookDecl{},
 	}
@@ -167,8 +185,9 @@ func (h *Host[C]) emitLifecycle(topic, id, version string) {
 	})
 }
 
-// injectSurface 向插件注入能力面视图;SetSurface 属插件代码,panic 归一为日志
-// (注册/替换已入册,面注入 best-effort,不 crash 宿主)。
+// injectSurface 向插件注入能力面视图;SetSurface 属插件代码,panic 归一为日志。
+// Register 在入册后调用；Replace 在 prepare 阶段调用，失败会清退新 effect，
+// 成功才提交新目录。面注入本身保持 best-effort，不让 panic 炸穿宿主。
 func (h *Host[C]) injectSurface(sa contract.SurfaceAware, id string, s contract.Surface) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -217,6 +236,7 @@ func (h *Host[C]) Close(ctx context.Context) error {
 	}
 	h.pending = nil
 	h.pendingPlugins = map[string]contract.Plugin{}
+	h.pendingMeta = map[string]contract.Meta{}
 	h.mu.Unlock()
 	for _, pr := range pending {
 		if d, ok := pr.p.(contract.Disposer); ok {
@@ -257,13 +277,12 @@ func (h *Host[C]) Dependents(pluginID string) []string {
 	if _, ok := h.plugins[pluginID]; !ok {
 		return nil
 	}
-	slot := h.meta[pluginID].Slot
 	var out []string
 	for id, m := range h.meta {
 		if id == pluginID {
 			continue
 		}
-		if h.depBrokenByRemovalLocked(m, pluginID, slot) {
+		if h.depBrokenByRemovalLocked(m, pluginID) {
 			out = append(out, id)
 		}
 	}
@@ -305,6 +324,18 @@ func (h *Host[C]) Functions() []FnView {
 		out = append(out, FnView{PluginID: e.pluginID, Spec: e.spec})
 	}
 	return out
+}
+
+// Function 单函数目录直查(不经 Functions 全量快照):每次插件调用的结果纪律
+// 校验都查一次 Output schema,而 Functions 会分配并排序全部函数(千级)。
+func (h *Host[C]) Function(pluginID, fname string) (contract.FuncSpec, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e, ok := h.fns[pluginID+"."+fname]
+	if !ok {
+		return contract.FuncSpec{}, false
+	}
+	return e.spec, true
 }
 
 func (h *Host[C]) AppliedConfig(pluginID string) (json.RawMessage, bool) {

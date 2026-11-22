@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ejfkdev/egop/contract"
 	"github.com/ejfkdev/egop/undo"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -26,10 +27,78 @@ type inst struct {
 	mod    api.Module
 	mu     sync.Mutex
 	broken atomic.Bool // 意外打断(ctx 取消/trap):本实例 fail-closed,acquire 时 revive
-	unsubs undo.Catcher
+	// closeOnRelease 让 Close 超时后仍由持锁调用在返回路径清理实例资源;
+	// 不另起可能永久等待实例锁的 goroutine。
+	closeOnRelease atomic.Bool
+	unsubs         undo.Catcher
 
 	netSeq    int64                // 出站流式 body 句柄序号(本 inst mu 下自增)
 	netBodies map[string]io.Reader // 句柄 → 未读完的响应 body
+	kvTx      *kvUpdate            // 当前模块的 KV 事务(本 inst mu 下访问)
+}
+
+// kvUpdate 把 backend 的同步 Update 回调横跨多次 guest ABI 调用。宿主 goroutine
+// 持 backend 锁等待 done；当前 inst 的普通 kv_* import 改用 view，不再次取锁。
+type kvUpdate struct {
+	view     contract.KeyValue
+	done     chan struct{}
+	finished chan struct{}
+	stopOnce sync.Once
+	err      error // 只在 finished 关闭后读取
+}
+
+func (tx *kvUpdate) stop() { tx.stopOnce.Do(func() { close(tx.done) }) }
+
+// beginKVUpdate 进入 backend Update 并等待其事务视图就绪(调用方持 inst.mu)。
+// 旧 backend 没有扩展时明确报错；绝不退回无锁 Get/Put 序列。
+func (i *inst) beginKVUpdate(kv contract.KeyValue) (contract.KeyValue, error) {
+	if i.kvTx != nil {
+		return nil, fmt.Errorf("kv update already active")
+	}
+	updater, ok := kv.(interface {
+		Update(func(contract.KeyValue)) error
+	})
+	if !ok {
+		return nil, fmt.Errorf("kv update not supported by backend")
+	}
+	tx := &kvUpdate{done: make(chan struct{}), finished: make(chan struct{})}
+	ready := make(chan contract.KeyValue, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				tx.err = fmt.Errorf("kv update backend panic: %v", r)
+			}
+			close(tx.finished)
+		}()
+		tx.err = updater.Update(func(view contract.KeyValue) {
+			tx.view = view
+			ready <- view
+			<-tx.done
+		})
+	}()
+	select {
+	case view := <-ready:
+		i.kvTx = tx
+		return view, nil
+	case <-tx.finished:
+		tx.stop() // 防御异步/异常 backend:回调若迟到也不得遗留 goroutine。
+		if tx.err != nil {
+			return nil, tx.err
+		}
+		return nil, fmt.Errorf("kv update backend returned before callback")
+	}
+}
+
+// endKVUpdate 幂等释放当前事务并等待 backend 退出(调用方持 inst.mu)。
+func (i *inst) endKVUpdate() error {
+	tx := i.kvTx
+	if tx == nil {
+		return nil
+	}
+	i.kvTx = nil
+	tx.stop()
+	<-tx.finished
+	return tx.err
 }
 
 func newInst(name string) *inst {
@@ -72,6 +141,8 @@ func (i *inst) netCloseAll() {
 // ctx 取消/超时 → 看门狗经 CloseWithExitCode 打断 guest 并把本实例置 broken
 // (下次调用 revive)——挂死的 guest 不永挂调用方/投递方。
 func (i *inst) callCore(p *Plugin, ctx context.Context, fname string, args ...string) ([]uint64, error) {
+	// guest trap/取消/遗漏 end 都不能把 backend 路径锁带进下一次调用。
+	defer i.endKVUpdate()
 	if i.broken.Load() {
 		return nil, fmt.Errorf("wasm plugin %s: instance %s closed", p.name, i.name)
 	}
@@ -102,6 +173,12 @@ func (i *inst) callCore(p *Plugin, ctx context.Context, fname string, args ...st
 	for _, a := range args {
 		ptr, err := allocWriteGuest(ctx, i.mod, []byte(a))
 		if err != nil {
+			// 非 ctx 取消的分配失败=实例已死(module closed 等)——置 broken,
+			// 下次调用 revive。此前只有看门狗中断路径置 broken:guest 自发
+			// exit/trap 后实例永不自愈,插件僵死到进程重启(生产事故实锤)。
+			if ctx.Err() == nil {
+				i.broken.Store(true)
+			}
 			return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, fname, err)
 		}
 		params = append(params, uint64(ptr), uint64(len(a)))
@@ -112,6 +189,9 @@ func (i *inst) callCore(p *Plugin, ctx context.Context, fname string, args ...st
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("wasm plugin %s: %s: interrupted: %w", p.name, fname, ctx.Err())
 		}
+		// guest trap/自发退出(exit_code 等)=实例不可信,置 broken 待 revive
+		// (fail-closed:当次调用如实报错,绝不带病复用)。
+		i.broken.Store(true)
 		return nil, fmt.Errorf("wasm plugin %s: %s: %w", p.name, fname, err)
 	}
 	return results, nil

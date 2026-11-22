@@ -2,12 +2,30 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 )
 
 func v(schema, value string) []string {
 	return Validate(json.RawMessage(schema), json.RawMessage(value), "value")
+}
+
+func TestValidateBooleanSchemas(t *testing.T) {
+	for _, input := range []string{`null`, `true`, `{"a":1}`, `"text"`} {
+		if got := v(`true`, input); len(got) != 0 {
+			t.Fatalf("true schema must accept %s: %v", input, got)
+		}
+		if got := v(`false`, input); len(got) == 0 {
+			t.Fatalf("false schema must reject %s", input)
+		}
+	}
 }
 
 func TestValidateSingleType(t *testing.T) {
@@ -180,5 +198,59 @@ func TestEntriesLookupAndValidateConfig(t *testing.T) {
 	}
 	if got := ValidateConfig(json.RawMessage(`{"type":"integer"}`), json.RawMessage(`"5"`)); len(got) == 0 {
 		t.Fatal("ValidateConfig should reject string \"5\" for integer")
+	}
+}
+
+func TestValidateDocumentAllowsDocumentLocalReferences(t *testing.T) {
+	document := json.RawMessage(`{"$defs":{"count":{"type":"integer","minimum":1}},"$ref":"#/$defs/count"}`)
+	if err := ValidateDocument(document); err != nil {
+		t.Fatalf("document-local reference: %v", err)
+	}
+	if got := Validate(document, json.RawMessage(`2`), "value"); len(got) != 0 {
+		t.Fatalf("valid local-ref value: %v", got)
+	}
+	if got := Validate(document, json.RawMessage(`0`), "value"); len(got) == 0 {
+		t.Fatal("local-ref minimum must still be enforced")
+	}
+}
+
+func TestSchemaRejectsExternalFileReference(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "external.json")
+	if err := os.WriteFile(path, []byte(`{"type":"integer"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reference := (&url.URL{Scheme: "file", Path: path}).String()
+	document, err := json.Marshal(map[string]any{"$ref": reference})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDocument(document); err == nil {
+		t.Fatal("ValidateDocument loaded an external file reference")
+	}
+	if got := Validate(document, json.RawMessage(`1`), "value"); len(got) == 0 {
+		t.Fatal("Validate loaded an external file reference")
+	}
+}
+
+func TestSchemaNeverFetchesRemoteReference(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/schema+json")
+		_, _ = fmt.Fprint(w, `{"type":"integer"}`)
+	}))
+	defer server.Close()
+	document, err := json.Marshal(map[string]any{"$ref": server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDocument(document); err == nil {
+		t.Fatal("ValidateDocument accepted a remote reference")
+	}
+	if got := Validate(document, json.RawMessage(`1`), "value"); len(got) == 0 {
+		t.Fatal("Validate accepted a remote reference")
+	}
+	if got := atomic.LoadInt32(&requests); got != 0 {
+		t.Fatalf("remote reference fetched %d times", got)
 	}
 }

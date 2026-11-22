@@ -26,7 +26,13 @@ func okEnvelope(raw json.RawMessage) []byte { return mustMarshal(envelope{OK: tr
 func b64Envelope(b []byte) []byte {
 	return mustMarshal(envelope{OK: true, ResultB64: base64.StdEncoding.EncodeToString(b)})
 }
-func errEnvelope(err error) []byte { return mustMarshal(envelope{Error: err.Error()}) }
+func errEnvelope(err error) []byte {
+	env := envelope{Error: err.Error()}
+	if detail, ok := contract.ErrorDetailOf(err); ok {
+		env.ErrorDetail = &detail
+	}
+	return mustMarshal(env)
+}
 
 func mustMarshal(v any) []byte {
 	b, err := json.Marshal(v)
@@ -112,6 +118,9 @@ func decodeEnvelope(payload json.RawMessage) (json.RawMessage, error) {
 		return nil, fmt.Errorf("bad result envelope: %w", err)
 	}
 	if !env.OK {
+		if env.ErrorDetail != nil {
+			return nil, contract.NewCallError(*env.ErrorDetail)
+		}
 		return nil, fmt.Errorf("%s", env.Error)
 	}
 	if env.ResultB64 != "" {

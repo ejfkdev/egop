@@ -69,14 +69,17 @@ func LookupEntry(name string) (Entry, bool) {
 // type 可为单个类型串或类型数组（任意其一即通过）;anyOf 为候选子 schema 数组
 // （任一通过即通过）——均用于"一个字段允许多种格式"。
 func Validate(schema json.RawMessage, value json.RawMessage, root string) []string {
-	if len(schema) == 0 || string(schema) == "null" {
+	trimmed := strings.TrimSpace(string(schema))
+	if trimmed == "true" {
 		return nil
 	}
-	var s map[string]any
-	if err := json.Unmarshal(schema, &s); err != nil {
-		return []string{fmt.Sprintf("schema: %v", err)}
+	if trimmed == "false" {
+		return []string{root + ": false schema rejects every value"}
 	}
-	return validateNode(s, value, root)
+	if len(schema) == 0 || trimmed == "null" {
+		return nil
+	}
+	return validateStrict(schema, value, root)
 }
 
 // ValidateConfig 校验配置——Validate 以 root 命名 "config" 的便捷面。

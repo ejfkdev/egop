@@ -29,17 +29,17 @@ func pluginKey(id string) string { return "p:" + id }
 func slotKey(name string) string { return "s:" + name }
 
 // needKeys 收集 Meta 的 DepInit 依赖键(只排序硬依赖;call/soft 不参与装载序)。
+// Plugin/Slot 双设时与 Register/Replace/Remove 一致采用 Slot 优先。
 func needKeys(m contract.Meta) []string {
 	var out []string
 	for _, r := range m.Requires.Deps {
 		if r.Kind != contract.DepInit {
 			continue
 		}
-		switch {
-		case r.Plugin != "":
-			out = append(out, pluginKey(r.Plugin))
-		case r.Slot != "":
+		if r.Slot != "" {
 			out = append(out, slotKey(r.Slot))
+		} else if r.Plugin != "" {
+			out = append(out, pluginKey(r.Plugin))
 		}
 	}
 	return out
@@ -109,9 +109,10 @@ func (h *Host[C]) RegisterMany(plugs []contract.Plugin) RegisterReport {
 	}
 	// eventually 收"最终会到位的依赖键"——待补载插件提供的 id/槽位,以及本批被转为待补载的条目。
 	eventually := map[string]bool{}
-	for id, p := range h.pendingPlugins {
+	for id := range h.pendingPlugins {
+		m := h.pendingMeta[id]
 		eventually[pluginKey(id)] = true
-		if s := p.Meta().Slot; s != "" {
+		if s := m.Slot; s != "" {
 			eventually[slotKey(s)] = true
 		}
 	}
@@ -125,7 +126,7 @@ func (h *Host[C]) RegisterMany(plugs []contract.Plugin) RegisterReport {
 	entries := make([]entry, 0, len(plugs))
 	byID := map[string]bool{}
 	for _, p := range plugs {
-		m := p.Meta()
+		m := contract.CloneMeta(p.Meta())
 		if m.ID == "" {
 			rep.Failed = append(rep.Failed, RegisterFailure{ID: "", Err: fmt.Errorf("host: empty id rejected")})
 			continue

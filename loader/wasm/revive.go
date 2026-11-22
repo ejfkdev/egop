@@ -36,12 +36,15 @@ func (p *Plugin) reviveLocked(ctx context.Context, i *inst) error {
 	}
 	_ = i.unsubs.Close()
 	i.unsubs = undo.Catcher{}
+	_ = i.endKVUpdate()
 	if i.mod != nil {
 		_ = i.mod.Close(context.WithoutCancel(ctx))
 		i.mod = nil
 	}
 	i.netCloseAll()
-	mod, err := p.instantiateOne(context.WithoutCancel(ctx), compiled, i.name)
+	rctx, cancel := context.WithTimeout(ctx, initTimeout)
+	mod, err := p.instantiateOne(rctx, compiled, i.name)
+	cancel()
 	if err != nil {
 		i.broken.Store(true)
 		return fmt.Errorf("wasm plugin %s: revive: %w", p.name, err)
